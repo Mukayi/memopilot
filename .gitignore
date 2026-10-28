@@ -1,0 +1,22 @@
+# macOS
+.DS_Store
+._*
+
+# SwiftPM / Xcode build artifacts
+.build/
+.build*/
+.swiftpm/
+DerivedData/
+*.xcodeproj
+*.xcworkspace
+xcuserdata/
+*.profraw
+*.profdata
+
+# Local packaged app staging (Releases/MemoPilot-macOS-arm64.zip is tracked)
+dist/
+
+# Internal design specs & scratch plans
+docs/superpowers/
+docs/*.png
+docs/*.icns
