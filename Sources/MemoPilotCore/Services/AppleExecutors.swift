@@ -8,6 +8,7 @@ public struct ExecutionReport: Sendable {
     public var createdAlarmsCount: Int = 0
     public var createdNotesCount: Int = 0
     public var committedItemIDs: Set<UUID> = []
+    public var committedExternalIDs: [UUID: String] = [:]
     public var triggeredAlarms: [String] = []
     public var errors: [String] = []
 
@@ -68,6 +69,104 @@ public final class AppleExecutors: @unchecked Sendable {
 
     private init() {}
 
+    // MARK: - 1-Click Jump to Native macOS Apps (Calendar / Reminders / Notes)
+
+    @MainActor
+    public static func openSystemApp(for kind: DraftTargetKind) {
+        let appPath: String
+        switch kind {
+        case .calendar:
+            appPath = "/System/Applications/Calendar.app"
+        case .reminder, .alarm:
+            appPath = "/System/Applications/Reminders.app"
+        case .note:
+            appPath = "/System/Applications/Notes.app"
+        }
+        let config = NSWorkspace.OpenConfiguration()
+        config.activates = true
+        NSWorkspace.shared.openApplication(at: URL(fileURLWithPath: appPath), configuration: config)
+    }
+
+    @MainActor
+    public static func openInTargetApp(for item: DraftItem) {
+        // 1. Immediately bring the target system app to front
+        openSystemApp(for: item.targetKind)
+
+        // 2. Deep-link / navigate to the exact date, reminder, or note via JXA
+        let kind = item.targetKind
+        let extID = item.createdExternalID ?? ""
+        let title = item.title
+        let startISO = item.startISO.isEmpty ? item.alarmTimeISO : item.startISO
+        let parsedDate = PromptBuilder.parseISODate(startISO)
+
+        Task.detached(priority: .userInitiated) {
+            switch kind {
+            case .calendar:
+                if let date = parsedDate {
+                    let epochMs = Int64(date.timeIntervalSince1970 * 1000.0)
+                    let jxa = """
+                    const Cal = Application("Calendar");
+                    Cal.activate();
+                    Cal.viewCalendar({at: new Date(\(epochMs))});
+                    """
+                    Self.runQuickJXA(jxa, arguments: [])
+                }
+
+            case .reminder, .alarm:
+                let searchTitle = (kind == .alarm && !title.hasPrefix("⏰")) ? "⏰ 【闹钟】\(title)" : title
+                let jxa = """
+                ObjC.import('Foundation');
+                const args = $.NSProcessInfo.processInfo.arguments;
+                const targetID = ObjC.unwrap(args.objectAtIndex(4));
+                const targetTitle = ObjC.unwrap(args.objectAtIndex(5));
+                const Rem = Application("Reminders");
+                Rem.activate();
+                try {
+                    if (targetID.length > 0) {
+                        Rem.reminders.byId(targetID).show();
+                    } else if (targetTitle.length > 0) {
+                        const found = Rem.reminders.whose({name: targetTitle})();
+                        if (found.length > 0) { found[0].show(); }
+                    }
+                } catch (e) {}
+                """
+                Self.runQuickJXA(jxa, arguments: [extID, searchTitle])
+
+            case .note:
+                let jxa = """
+                ObjC.import('Foundation');
+                const args = $.NSProcessInfo.processInfo.arguments;
+                const targetID = ObjC.unwrap(args.objectAtIndex(4));
+                const targetTitle = ObjC.unwrap(args.objectAtIndex(5));
+                const Notes = Application("Notes");
+                Notes.activate();
+                try {
+                    if (targetID.length > 0) {
+                        Notes.notes.byId(targetID).show();
+                    } else if (targetTitle.length > 0) {
+                        const found = Notes.notes.whose({name: targetTitle})();
+                        if (found.length > 0) { found[0].show(); }
+                    }
+                } catch (e) {}
+                """
+                Self.runQuickJXA(jxa, arguments: [extID, title])
+            }
+        }
+    }
+
+    private static func runQuickJXA(_ script: String, arguments: [String]) {
+        let process = Process()
+        process.executableURL = URL(fileURLWithPath: "/usr/bin/osascript")
+        process.arguments = ["-l", "JavaScript", "-e", script] + arguments
+        process.standardInput = FileHandle.nullDevice
+        process.standardOutput = FileHandle.nullDevice
+        process.standardError = FileHandle.nullDevice
+        try? process.run()
+        process.waitUntilExit()
+    }
+
+    // MARK: - Execution
+
     public func execute(plan: ParsedPlan) async -> ExecutionReport {
         var report = ExecutionReport()
 
@@ -85,9 +184,10 @@ public final class AppleExecutors: @unchecked Sendable {
                     }
                     for draft in selectedEvents {
                         do {
-                            try createCalendarEvent(from: draft)
+                            let evID = try createCalendarEvent(from: draft)
                             report.createdEventsCount += 1
                             report.committedItemIDs.insert(draft.id)
+                            if let evID { report.committedExternalIDs[draft.id] = evID }
                             if draft.needsAlarm {
                                 report.triggeredAlarms.append("\(draft.title) (\(draft.alarmTimeISO.isEmpty ? draft.startISO : draft.alarmTimeISO))")
                             }
@@ -114,18 +214,20 @@ public final class AppleExecutors: @unchecked Sendable {
                     }
                     for draft in selectedReminders {
                         do {
-                            try createReminder(from: draft)
+                            let remID = try createReminder(from: draft)
                             report.createdRemindersCount += 1
                             report.committedItemIDs.insert(draft.id)
+                            if let remID { report.committedExternalIDs[draft.id] = remID }
                         } catch {
                             report.errors.append("提醒「\(draft.title)」写入失败: \(error.localizedDescription)")
                         }
                     }
                     for alarmDraft in selectedAlarms {
                         do {
-                            try await createAlarmEntry(from: alarmDraft)
+                            let alarmID = try await createAlarmEntry(from: alarmDraft)
                             report.createdAlarmsCount += 1
                             report.committedItemIDs.insert(alarmDraft.id)
+                            if let alarmID { report.committedExternalIDs[alarmDraft.id] = alarmID }
                             report.triggeredAlarms.append("\(alarmDraft.title)")
                         } catch {
                             report.errors.append("闹钟「\(alarmDraft.title)」设置失败: \(error.localizedDescription)")
@@ -141,9 +243,12 @@ public final class AppleExecutors: @unchecked Sendable {
 
         for note in selectedNotes {
             do {
-                try await createAppleNoteAsync(from: note)
+                let noteID = try await createAppleNoteAsync(from: note)
                 report.createdNotesCount += 1
                 report.committedItemIDs.insert(note.id)
+                if let noteID, !noteID.isEmpty {
+                    report.committedExternalIDs[note.id] = noteID
+                }
             } catch {
                 report.errors.append("备忘录「\(note.title)」写入失败: \(error.localizedDescription)")
             }
@@ -152,22 +257,22 @@ public final class AppleExecutors: @unchecked Sendable {
         return report
     }
 
-    private func createAlarmEntry(from draft: DraftItem) async throws {
+    private func createAlarmEntry(from draft: DraftItem) async throws -> String? {
         let isoTarget = draft.startISO.isEmpty ? draft.alarmTimeISO : draft.startISO
         guard let alarmDate = PromptBuilder.parseISODate(isoTarget) else {
             throw NSError(domain: "MemoPilot.Alarm", code: 10, userInfo: [NSLocalizedDescriptionKey: "无法解析闹钟时间（\(isoTarget)）"])
         }
 
         let alarmTitle = draft.title.hasPrefix("⏰") ? draft.title : "⏰ 【闹钟】\(draft.title)"
+        var createdRemID: String?
 
         try lock.withLock {
-            // 1. High-priority critical Reminder with exact & pre-alarm offsets (syncs to iPhone via iCloud)
             if let remCal = eventStore.defaultCalendarForNewReminders() ?? eventStore.calendars(for: .reminder).first(where: { $0.allowsContentModifications }) {
                 let reminder = EKReminder(eventStore: eventStore)
                 reminder.calendar = remCal
                 reminder.title = alarmTitle
                 reminder.notes = [draft.location, draft.notes].filter { !$0.isEmpty }.joined(separator: " · ")
-                reminder.priority = 1 // Highest priority
+                reminder.priority = 1
 
                 var comps = Calendar.current.dateComponents([.year, .month, .day, .hour, .minute], from: alarmDate)
                 comps.timeZone = TimeZone.current
@@ -179,9 +284,9 @@ public final class AppleExecutors: @unchecked Sendable {
                     reminder.addAlarm(EKAlarm(absoluteDate: alarmDate.addingTimeInterval(-Double(lead * 60))))
                 }
                 try eventStore.save(reminder, commit: true)
+                createdRemID = reminder.calendarItemExternalIdentifier
             }
 
-            // 2. Also add a 15-minute Calendar alarm block so both Calendar & Reminders ring
             if let evCal = eventStore.defaultCalendarForNewEvents ?? eventStore.calendars(for: .event).first(where: { $0.allowsContentModifications }) {
                 let ev = EKEvent(eventStore: eventStore)
                 ev.calendar = evCal
@@ -199,7 +304,6 @@ public final class AppleExecutors: @unchecked Sendable {
             }
         }
 
-        // 3. Schedule local Mac frontmost sound & critical modal alert
         await MainActor.run {
             LocalAlarmScheduler.shared.scheduleAlarm(
                 id: draft.id,
@@ -208,9 +312,10 @@ public final class AppleExecutors: @unchecked Sendable {
                 notes: draft.notes
             )
         }
+        return createdRemID
     }
 
-    private func createCalendarEvent(from draft: CalendarEventDraft) throws {
+    private func createCalendarEvent(from draft: CalendarEventDraft) throws -> String? {
         try lock.withLock {
             guard let calendar = eventStore.defaultCalendarForNewEvents ?? eventStore.calendars(for: .event).first(where: { $0.allowsContentModifications }) else {
                 throw NSError(domain: "MemoPilot.EventKit", code: 1, userInfo: [NSLocalizedDescriptionKey: "未找到可写入的日历"])
@@ -248,10 +353,11 @@ public final class AppleExecutors: @unchecked Sendable {
             }
 
             try eventStore.save(event, span: .thisEvent, commit: true)
+            return event.calendarItemExternalIdentifier
         }
     }
 
-    private func createReminder(from draft: ReminderDraft) throws {
+    private func createReminder(from draft: ReminderDraft) throws -> String? {
         try lock.withLock {
             guard let calendar = eventStore.defaultCalendarForNewReminders() ?? eventStore.calendars(for: .reminder).first(where: { $0.allowsContentModifications }) else {
                 throw NSError(domain: "MemoPilot.EventKit", code: 2, userInfo: [NSLocalizedDescriptionKey: "未找到默认提醒事项列表"])
@@ -275,6 +381,7 @@ public final class AppleExecutors: @unchecked Sendable {
             }
 
             try eventStore.save(reminder, commit: true)
+            return reminder.calendarItemExternalIdentifier
         }
     }
 
@@ -285,7 +392,7 @@ public final class AppleExecutors: @unchecked Sendable {
             .replacingOccurrences(of: "\"", with: "&quot;")
     }
 
-    private func createAppleNoteAsync(from draft: KeyNoteDraft) async throws {
+    private func createAppleNoteAsync(from draft: KeyNoteDraft) async throws -> String? {
         try await Task.detached(priority: .userInitiated) {
             let safeTitle = Self.htmlEscape(draft.title)
             let safeCategory = Self.htmlEscape(draft.category)
@@ -302,9 +409,11 @@ public final class AppleExecutors: @unchecked Sendable {
                 tell application "Notes"
                     tell default account
                         try
-                            make new note at default folder with properties {name:noteTitle, body:noteBody}
+                            set createdNote to make new note at default folder with properties {name:noteTitle, body:noteBody}
+                            return id of createdNote
                         on error
-                            make new note with properties {name:noteTitle, body:noteBody}
+                            set createdNote to make new note with properties {name:noteTitle, body:noteBody}
+                            return id of createdNote
                         end try
                     end tell
                 end tell
@@ -316,11 +425,13 @@ public final class AppleExecutors: @unchecked Sendable {
             process.arguments = ["-e", script, draft.title, fullHTML]
             process.standardInput = FileHandle.nullDevice
 
+            let outPipe = Pipe()
             let errPipe = Pipe()
+            process.standardOutput = outPipe
             process.standardError = errPipe
-            process.standardOutput = FileHandle.nullDevice
 
             try process.run()
+            let outData = outPipe.fileHandleForReading.readDataToEndOfFile()
             let errData = errPipe.fileHandleForReading.readDataToEndOfFile()
             process.waitUntilExit()
 
@@ -332,6 +443,7 @@ public final class AppleExecutors: @unchecked Sendable {
                     userInfo: [NSLocalizedDescriptionKey: errMsg]
                 )
             }
+            return String(data: outData, encoding: .utf8)?.trimmingCharacters(in: .whitespacesAndNewlines)
         }.value
     }
 }

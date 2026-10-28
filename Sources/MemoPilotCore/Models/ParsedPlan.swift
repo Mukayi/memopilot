@@ -16,12 +16,22 @@ public enum DraftTargetKind: String, Codable, CaseIterable, Identifiable, Sendab
         case .note:     return "doc.text"
         }
     }
+
+    public var systemAppName: String {
+        switch self {
+        case .calendar: return "日历"
+        case .reminder: return "提醒事项"
+        case .alarm:    return "提醒事项"
+        case .note:     return "备忘录"
+        }
+    }
 }
 
 public struct DraftItem: Codable, Sendable, Equatable, Identifiable {
     public var id: UUID
     public var isSelected: Bool
     public var isCommitted: Bool
+    public var createdExternalID: String?
     public var targetKind: DraftTargetKind
     public var title: String
     public var startISO: String
@@ -36,13 +46,14 @@ public struct DraftItem: Codable, Sendable, Equatable, Identifiable {
     public var category: String
 
     enum CodingKeys: String, CodingKey {
-        case id, isSelected, isCommitted, targetKind, title, startISO, endISO, location, notes, leadTimeMinutes, priority, needsAlarm, alarmTimeISO, reasonForLeadTime, category
+        case id, isSelected, isCommitted, createdExternalID, targetKind, title, startISO, endISO, location, notes, leadTimeMinutes, priority, needsAlarm, alarmTimeISO, reasonForLeadTime, category
     }
 
     public init(
         id: UUID = UUID(),
         isSelected: Bool = true,
         isCommitted: Bool = false,
+        createdExternalID: String? = nil,
         targetKind: DraftTargetKind,
         title: String,
         startISO: String = "",
@@ -59,6 +70,7 @@ public struct DraftItem: Codable, Sendable, Equatable, Identifiable {
         self.id = id
         self.isSelected = isSelected
         self.isCommitted = isCommitted
+        self.createdExternalID = createdExternalID
         self.targetKind = targetKind
         self.title = title
         self.startISO = startISO
@@ -78,6 +90,7 @@ public struct DraftItem: Codable, Sendable, Equatable, Identifiable {
         self.id = (try? c.decodeIfPresent(UUID.self, forKey: .id)) ?? UUID()
         self.isSelected = (try? c.decodeIfPresent(Bool.self, forKey: .isSelected)) ?? true
         self.isCommitted = (try? c.decodeIfPresent(Bool.self, forKey: .isCommitted)) ?? false
+        self.createdExternalID = try? c.decodeIfPresent(String.self, forKey: .createdExternalID)
         self.targetKind = (try? c.decodeIfPresent(DraftTargetKind.self, forKey: .targetKind)) ?? .reminder
         self.title = (try? c.decodeIfPresent(String.self, forKey: .title)) ?? ""
         self.startISO = (try? c.decodeIfPresent(String.self, forKey: .startISO)) ?? ""
@@ -436,10 +449,13 @@ public struct ParsedPlan: Codable, Sendable, Equatable {
         items.filter(\.isCommitted)
     }
 
-    public mutating func markItemsCommitted(_ ids: Set<UUID>) {
+    public mutating func markItemsCommitted(_ ids: Set<UUID>, externalIDs: [UUID: String] = [:]) {
         for idx in items.indices where ids.contains(items[idx].id) {
             items[idx].isCommitted = true
             items[idx].isSelected = false
+            if let extID = externalIDs[items[idx].id], !extID.isEmpty {
+                items[idx].createdExternalID = extID
+            }
         }
     }
 

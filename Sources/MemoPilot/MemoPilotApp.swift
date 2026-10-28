@@ -903,7 +903,10 @@ final class AppViewModel: ObservableObject {
             statusBanner = report.summaryText
 
             if !report.committedItemIDs.isEmpty {
-                planToCommit.markItemsCommitted(report.committedItemIDs)
+                planToCommit.markItemsCommitted(
+                    report.committedItemIDs,
+                    externalIDs: report.committedExternalIDs
+                )
             }
             if selectedRecordID == targetRecordID {
                 parsedPlan = planToCommit

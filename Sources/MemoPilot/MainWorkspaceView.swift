@@ -910,7 +910,7 @@ struct MainWorkspaceView: View {
     }
 
     private func statusBannerLine(_ text: String) -> some View {
-        HStack(alignment: .center, spacing: 6) {
+        HStack(alignment: .center, spacing: 8) {
             Circle()
                 .fill(viewModel.isErrorBanner ? palette.urgentTone : palette.committedTone)
                 .frame(width: 5.5, height: 5.5)
@@ -918,8 +918,45 @@ struct MainWorkspaceView: View {
                 .font(.system(size: 11))
                 .foregroundStyle(viewModel.isErrorBanner ? palette.urgentTone : .secondary)
                 .lineLimit(1)
+
             Spacer()
+
+            if text.hasPrefix("已写入：") {
+                HStack(spacing: 6) {
+                    if text.contains("日历") {
+                        quickOpenAppPill(title: "打开日历", kind: .calendar)
+                    }
+                    if text.contains("提醒") || text.contains("闹钟") {
+                        quickOpenAppPill(title: "打开提醒事项", kind: .reminder)
+                    }
+                    if text.contains("备忘录") {
+                        quickOpenAppPill(title: "打开备忘录", kind: .note)
+                    }
+                }
+            }
         }
+    }
+
+    private func quickOpenAppPill(title: String, kind: DraftTargetKind) -> some View {
+        Button {
+            AppleExecutors.openSystemApp(for: kind)
+        } label: {
+            HStack(alignment: .center, spacing: 3) {
+                Text(title)
+                    .font(.system(size: 10.5, weight: .medium))
+                Image(systemName: "arrow.up.right")
+                    .font(.system(size: 8.5, weight: .bold))
+            }
+            .foregroundStyle(.secondary)
+            .padding(.horizontal, 7)
+            .frame(height: 20)
+            .background(
+                RoundedRectangle(cornerRadius: 4.5, style: .continuous)
+                    .fill(palette.subtleButtonBg)
+            )
+        }
+        .buttonStyle(.plain)
+        .fixedSize()
     }
 
     // MARK: - Zero-Drawer, Strictly Aligned 2-Line Document Body
@@ -1095,11 +1132,7 @@ struct MainWorkspaceView: View {
                         .frame(height: 1)
                         .padding(.vertical, 8)
                 }
-                sectionStatusHeader(
-                    title: "已写入系统 (\(committed.count))",
-                    dotColor: palette.committedTone,
-                    hint: "如需再次写入可重新勾选"
-                )
+                committedSectionHeader(committedItems: committed)
                 ForEach(committed) { item in
                     editableDraftRow(item: item)
                     if item.id != committed.last?.id {
@@ -1127,6 +1160,40 @@ struct MainWorkspaceView: View {
                     .foregroundStyle(.tertiary)
             }
             Spacer()
+        }
+        .padding(.top, 10)
+        .padding(.bottom, 2)
+    }
+
+    private func committedSectionHeader(committedItems: [DraftItem]) -> some View {
+        let hasCalendar = committedItems.contains { $0.targetKind == .calendar }
+        let hasReminder = committedItems.contains { $0.targetKind == .reminder || $0.targetKind == .alarm }
+        let hasNote     = committedItems.contains { $0.targetKind == .note }
+
+        return HStack(alignment: .center, spacing: 6) {
+            Circle()
+                .fill(palette.committedTone)
+                .frame(width: 5.5, height: 5.5)
+            Text("已写入系统 (\(committedItems.count))")
+                .font(.system(size: 11, weight: .semibold))
+                .foregroundStyle(.secondary)
+            Text("· 点击条目右侧可直达对应应用")
+                .font(.system(size: 10.5))
+                .foregroundStyle(.tertiary)
+
+            Spacer()
+
+            HStack(spacing: 6) {
+                if hasCalendar {
+                    quickOpenAppPill(title: "打开日历", kind: .calendar)
+                }
+                if hasReminder {
+                    quickOpenAppPill(title: "打开提醒事项", kind: .reminder)
+                }
+                if hasNote {
+                    quickOpenAppPill(title: "打开备忘录", kind: .note)
+                }
+            }
         }
         .padding(.top, 10)
         .padding(.bottom, 2)
@@ -1204,23 +1271,52 @@ struct MainWorkspaceView: View {
                     .buttonStyle(.plain)
 
                     if current.isCommitted {
-                        HStack(alignment: .center, spacing: 3) {
-                            Image(systemName: "checkmark.seal.fill")
-                                .font(.system(size: 9))
-                            Text("已写入")
-                                .font(.system(size: 9.5, weight: .medium))
+                        Button {
+                            AppleExecutors.openInTargetApp(for: current)
+                        } label: {
+                            HStack(alignment: .center, spacing: 3) {
+                                Image(systemName: "checkmark.seal.fill")
+                                    .font(.system(size: 9))
+                                Text("已写入 · 打开\(current.targetKind.systemAppName)")
+                                    .font(.system(size: 9.5, weight: .medium))
+                                Image(systemName: "arrow.up.right")
+                                    .font(.system(size: 8, weight: .bold))
+                            }
+                            .foregroundStyle(palette.committedTone)
+                            .padding(.horizontal, 6.5)
+                            .frame(height: 18)
+                            .background(
+                                RoundedRectangle(cornerRadius: 4, style: .continuous)
+                                    .fill(palette.committedTone.opacity(0.12))
+                            )
                         }
-                        .foregroundStyle(palette.committedTone)
-                        .padding(.horizontal, 5.5)
-                        .frame(height: 17)
-                        .background(
-                            RoundedRectangle(cornerRadius: 4, style: .continuous)
-                                .fill(palette.committedTone.opacity(0.11))
-                        )
+                        .buttonStyle(.plain)
                         .fixedSize()
+                        .help("点击在系统「\(current.targetKind.systemAppName)」中打开并定位到此条记录")
                     }
 
                     Spacer(minLength: 8)
+
+                    Button {
+                        AppleExecutors.openInTargetApp(for: current)
+                    } label: {
+                        HStack(alignment: .center, spacing: 2.5) {
+                            Text(current.targetKind.systemAppName)
+                                .font(.system(size: 10.5, weight: .medium))
+                            Image(systemName: "arrow.up.right")
+                                .font(.system(size: 8.5, weight: .bold))
+                        }
+                        .foregroundStyle(.secondary)
+                        .padding(.horizontal, 7)
+                        .frame(height: 19)
+                        .background(
+                            RoundedRectangle(cornerRadius: 4, style: .continuous)
+                                .fill(palette.subtleButtonBg)
+                        )
+                    }
+                    .buttonStyle(.plain)
+                    .fixedSize()
+                    .help("一键跳转到系统「\(current.targetKind.systemAppName)」查看")
 
                     Button {
                         isPopoverOpen.wrappedValue.toggle()
@@ -1270,6 +1366,14 @@ struct MainWorkspaceView: View {
             draftEditorPopover(item: current)
         }
         .contextMenu {
+            Button {
+                AppleExecutors.openInTargetApp(for: current)
+            } label: {
+                Label("在「\(current.targetKind.systemAppName)」中打开查看 ↗", systemImage: "arrow.up.forward.app")
+            }
+
+            Divider()
+
             Menu("切换类型（日历 / 提醒 / 闹钟 / 备忘）") {
                 ForEach(DraftTargetKind.allCases) { kind in
                     Button {
