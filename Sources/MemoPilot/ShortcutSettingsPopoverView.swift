@@ -31,6 +31,7 @@ struct ShortcutSettingsPopoverView: View {
     @ObservedObject var viewModel: AppViewModel
     @State private var recordingSlot: ShortcutTargetSlot?
     @State private var eventMonitor: Any?
+    @State private var warningMessage: String?
 
     var body: some View {
         VStack(alignment: .leading, spacing: 14) {
@@ -40,6 +41,7 @@ struct ShortcutSettingsPopoverView: View {
                 Spacer()
                 Button("恢复默认") {
                     stopRecording()
+                    warningMessage = nil
                     viewModel.resetHotKeysToDefault()
                 }
                 .font(.system(size: 11, weight: .medium))
@@ -51,6 +53,24 @@ struct ShortcutSettingsPopoverView: View {
                 .font(.system(size: 11))
                 .foregroundStyle(.secondary)
                 .lineSpacing(2)
+
+            if let warningMessage {
+                HStack(spacing: 6) {
+                    Image(systemName: "exclamationmark.triangle.fill")
+                        .font(.system(size: 11))
+                        .foregroundStyle(.orange)
+                    Text(warningMessage)
+                        .font(.system(size: 11, weight: .medium))
+                        .foregroundStyle(.orange)
+                }
+                .padding(.horizontal, 10)
+                .padding(.vertical, 6)
+                .frame(maxWidth: .infinity, alignment: .leading)
+                .background(
+                    RoundedRectangle(cornerRadius: 6, style: .continuous)
+                        .fill(Color.orange.opacity(0.10))
+                )
+            }
 
             Divider()
 
@@ -98,6 +118,9 @@ struct ShortcutSettingsPopoverView: View {
         .padding(16)
         .frame(width: 390)
         .onDisappear {
+            stopRecording()
+        }
+        .onReceive(NotificationCenter.default.publisher(for: NSApplication.didResignActiveNotification)) { _ in
             stopRecording()
         }
     }
@@ -168,8 +191,15 @@ struct ShortcutSettingsPopoverView: View {
         )
     }
 
+    private static let reservedCommandOnlyKeyCodes: Set<Int> = [
+        kVK_ANSI_Q, kVK_ANSI_W, kVK_ANSI_H, kVK_ANSI_M,
+        kVK_ANSI_C, kVK_ANSI_V, kVK_ANSI_X, kVK_ANSI_A,
+        kVK_ANSI_Z, kVK_Tab, kVK_Space
+    ]
+
     private func startRecording(for slot: ShortcutTargetSlot) {
         stopRecording()
+        warningMessage = nil
         recordingSlot = slot
         // Pause global hotkeys while recording so pressing the current hotkey doesn't fire the global action
         GlobalHotKeyService.shared.unregisterHotKeys()
@@ -199,6 +229,15 @@ struct ShortcutSettingsPopoverView: View {
             let carbonMods = HotKeyBinding.carbonModifiers(from: flags)
             guard carbonMods != 0 || isFunctionKey else {
                 NSSound.beep()
+                warningMessage = "请至少搭配一个修饰键（⌥ / ⌘ / ⌃ / ⇧）或使用 F1–F12"
+                return nil
+            }
+
+            // Block single-modifier Command shortcuts that hijack core macOS editing/system keys
+            if carbonMods == UInt32(cmdKey) && Self.reservedCommandOnlyKeyCodes.contains(Int(keyCode)) {
+                NSSound.beep()
+                let attempted = HotKeyBinding(keyCode: keyCode, carbonModifiers: carbonMods, isEnabled: true).displayString
+                warningMessage = "\(attempted) 为系统核心快捷键，请搭配 ⌥ 或 ⇧ 使用"
                 return nil
             }
 
@@ -210,22 +249,49 @@ struct ShortcutSettingsPopoverView: View {
 
     private func applyRecordedBinding(for slot: ShortcutTargetSlot, keyCode: UInt32, carbonMods: UInt32, isEnabled: Bool) {
         var cfg = viewModel.hotKeyConfig
+        let newBinding = HotKeyBinding(keyCode: keyCode, carbonModifiers: carbonMods, isEnabled: true)
+
+        if isEnabled {
+            // Avoid duplicate active bindings across slots
+            if slot != .toggleWindow,
+               cfg.toggleWindow.isEnabled,
+               cfg.toggleWindow.keyCode == keyCode,
+               cfg.toggleWindow.carbonModifiers == carbonMods {
+                cfg.toggleWindow.isEnabled = false
+                warningMessage = "已将该组合键移交当前功能，原「呼出/隐藏主窗口」快捷键已自动停用"
+            }
+            if slot != .clipboardAnalyze,
+               cfg.clipboardAnalyze.isEnabled,
+               cfg.clipboardAnalyze.keyCode == keyCode,
+               cfg.clipboardAnalyze.carbonModifiers == carbonMods {
+                cfg.clipboardAnalyze.isEnabled = false
+                warningMessage = "已将该组合键移交当前功能，原「读取剪贴板」快捷键已自动停用"
+            }
+            if slot != .quickScreenshot,
+               cfg.quickScreenshot.isEnabled,
+               cfg.quickScreenshot.keyCode == keyCode,
+               cfg.quickScreenshot.carbonModifiers == carbonMods {
+                cfg.quickScreenshot.isEnabled = false
+                warningMessage = "已将该组合键移交当前功能，原「框选截图」快捷键已自动停用"
+            }
+        }
+
         switch slot {
         case .toggleWindow:
             if isEnabled {
-                cfg.toggleWindow = HotKeyBinding(keyCode: keyCode, carbonModifiers: carbonMods, isEnabled: true)
+                cfg.toggleWindow = newBinding
             } else {
                 cfg.toggleWindow.isEnabled = false
             }
         case .clipboardAnalyze:
             if isEnabled {
-                cfg.clipboardAnalyze = HotKeyBinding(keyCode: keyCode, carbonModifiers: carbonMods, isEnabled: true)
+                cfg.clipboardAnalyze = newBinding
             } else {
                 cfg.clipboardAnalyze.isEnabled = false
             }
         case .quickScreenshot:
             if isEnabled {
-                cfg.quickScreenshot = HotKeyBinding(keyCode: keyCode, carbonModifiers: carbonMods, isEnabled: true)
+                cfg.quickScreenshot = newBinding
             } else {
                 cfg.quickScreenshot.isEnabled = false
             }

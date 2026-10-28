@@ -101,6 +101,7 @@ final class AppViewModel: ObservableObject {
 
     private let historyStore = HistoryStore.shared
     private var saveDebounceTask: Task<Void, Never>?
+    private var conflictCheckTask: Task<Void, Never>?
     private var notificationObserver: NSObjectProtocol?
     private var remotePollingTimer: Timer?
     private var notesWatchTimer: Timer?
@@ -246,15 +247,16 @@ final class AppViewModel: ObservableObject {
         RunLoop.main.add(notesTimer, forMode: .common)
         notesWatchTimer = notesTimer
 
-        // Intercept Cmd+V when an image is on the pasteboard (e.g. copied screenshot from WeChat)
+        // Intercept Cmd+V when an image (or Finder image file) is on the pasteboard
         pasteMonitor = NSEvent.addLocalMonitorForEvents(matching: .keyDown) { [weak self] event in
+            guard let self, !self.isShowingShortcutSettings else { return event }
             let flags = event.modifierFlags.intersection([.command, .option, .control, .shift])
             if flags == .command && event.charactersIgnoringModifiers?.lowercased() == "v" {
-                let pb = NSPasteboard.general
-                let hasText = !(pb.string(forType: .string)?.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty ?? true)
-                if !hasText, let imgPath = ClipboardService.readImageFromPasteboardIfPresent() {
+                if let payload = ClipboardService.readPayload(),
+                   let imgPath = payload.imagePath,
+                   payload.text.isEmpty {
                     Task { @MainActor in
-                        self?.attachImageAndNotify(path: imgPath)
+                        self.attachImageAndNotify(path: imgPath)
                     }
                     return nil
                 }
@@ -275,13 +277,23 @@ final class AppViewModel: ObservableObject {
     }
 
     func refreshCalendarConflicts() {
-        guard let items = parsedPlan?.items else {
-            calendarConflicts = [:]
+        conflictCheckTask?.cancel()
+        guard let items = parsedPlan?.items, !items.isEmpty else {
+            if !calendarConflicts.isEmpty {
+                calendarConflicts = [:]
+            }
             return
         }
-        let detected = AppleExecutors.shared.detectCalendarConflicts(for: items)
-        if calendarConflicts != detected {
-            calendarConflicts = detected
+        conflictCheckTask = Task { @MainActor in
+            try? await Task.sleep(nanoseconds: 180_000_000)
+            guard !Task.isCancelled else { return }
+            let detected = await Task.detached(priority: .utility) {
+                AppleExecutors.shared.detectCalendarConflicts(for: items)
+            }.value
+            guard !Task.isCancelled else { return }
+            if self.calendarConflicts != detected {
+                self.calendarConflicts = detected
+            }
         }
     }
 
@@ -793,12 +805,8 @@ final class AppViewModel: ObservableObject {
         }
         withAnimation(.easeInOut(duration: 0.18)) {
             isInputCollapsed = false
-            if !payload.text.isEmpty {
-                inputText = payload.text
-            }
-            if let img = payload.imagePath {
-                attachedImagePath = img
-            }
+            inputText = payload.text
+            attachedImagePath = payload.imagePath
             isErrorBanner = false
             statusBanner = "📋 已读取剪贴板内容，正在智能拆解…"
         }
@@ -818,7 +826,9 @@ final class AppViewModel: ObservableObject {
         }
 
         do {
-            let newNotes = try await AppleNotesWatcherService.shared.fetchUnprocessedNotes()
+            let newNotes = try await AppleNotesWatcherService.shared.fetchUnprocessedNotes(
+                allowLaunchingNotesApp: manualTrigger
+            )
             guard !newNotes.isEmpty else {
                 if manualTrigger {
                     withAnimation(.easeInOut(duration: 0.18)) {

@@ -93,9 +93,11 @@ public final class HistoryStore: @unchecked Sendable {
             if tempPath.hasPrefix(capturesDirectoryURL.path) {
                 return tempPath
             }
-            let destURL = capturesDirectoryURL.appendingPathComponent("Capture-\(UUID().uuidString).png")
+            let srcURL = URL(fileURLWithPath: tempPath)
+            let ext = srcURL.pathExtension.isEmpty ? "png" : srcURL.pathExtension
+            let destURL = capturesDirectoryURL.appendingPathComponent("Capture-\(UUID().uuidString).\(ext)")
             do {
-                try FileManager.default.copyItem(at: URL(fileURLWithPath: tempPath), to: destURL)
+                try FileManager.default.copyItem(at: srcURL, to: destURL)
                 if tempPath.contains("MemoPilot-Capture-") {
                     try? FileManager.default.removeItem(atPath: tempPath)
                 }

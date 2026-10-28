@@ -268,18 +268,27 @@ struct MemoPilotTests {
         #expect(hk.displayString == "⌥C")
         let disabledHK = HotKeyBinding(keyCode: 8, carbonModifiers: 2048, isEnabled: false)
         #expect(disabledHK.displayString == "已关闭")
+
+        // Editing a committed item automatically resets isCommitted to false and selects it for re-commit
+        #expect(plan.updateItemTitle(id: item1.id, newTitle: "会议1（改期）") == true)
+        #expect(plan.pendingItems.count == 2)
+        #expect(plan.committedItems.count == 0)
+        #expect(plan.item(id: item1.id)?.isSelected == true)
     }
 
     @Test("CodexCLIBridge.buildCodexExecArguments places -- separator before prompt so variadic -i never swallows prompt")
     func codexExecArgumentsSeparatorBeforePrompt() {
+        #expect(AISpeedProfile.flash.codexReasoningEffort == "low")
         let argsWithImage = CodexCLIBridge.buildCodexExecArguments(
             tempDirPath: "/tmp/mp",
             schemaPath: "/tmp/mp/schema.json",
             outputPath: "/tmp/mp/output.json",
             imagePath: "/tmp/mp/shot.png",
-            prompt: "测试提示词",
+            prompt: "-带短横线开头的提示词",
             speedProfile: .flash
         )
+        #expect(!argsWithImage.contains("--ignore-user-config"))
+        #expect(argsWithImage.contains("mcp_servers={}"))
         let imageFlagIndex = argsWithImage.firstIndex(of: "-i")
         let separatorIndex = argsWithImage.firstIndex(of: "--")
         #expect(imageFlagIndex != nil)
@@ -287,8 +296,8 @@ struct MemoPilotTests {
         if let iIdx = imageFlagIndex, let sepIdx = separatorIndex {
             #expect(argsWithImage[iIdx + 1] == "/tmp/mp/shot.png")
             #expect(sepIdx == iIdx + 2)
-            #expect(argsWithImage[sepIdx + 1] == "测试提示词")
+            #expect(argsWithImage[sepIdx + 1] == "-带短横线开头的提示词")
         }
-        #expect(argsWithImage.suffix(2) == ["--", "测试提示词"])
+        #expect(argsWithImage.suffix(2) == ["--", "-带短横线开头的提示词"])
     }
 }

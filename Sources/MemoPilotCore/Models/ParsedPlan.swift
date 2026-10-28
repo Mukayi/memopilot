@@ -468,12 +468,20 @@ public struct ParsedPlan: Codable, Sendable, Equatable {
         items[idx].isSelected.toggle()
     }
 
+    private mutating func markModifiedAsPending(at idx: Int) {
+        if items[idx].isCommitted {
+            items[idx].isCommitted = false
+            items[idx].isSelected = true
+        }
+    }
+
     @discardableResult
     public mutating func setItemTargetKind(id: UUID, kind: DraftTargetKind) -> Bool {
         guard let idx = items.firstIndex(where: { $0.id == id }),
               items[idx].targetKind != kind else { return false }
 
         items[idx].targetKind = kind
+        markModifiedAsPending(at: idx)
 
         switch kind {
         case .calendar:
@@ -535,6 +543,7 @@ public struct ParsedPlan: Codable, Sendable, Equatable {
         guard let idx = items.firstIndex(where: { $0.id == id }),
               items[idx].title != newTitle else { return false }
         items[idx].title = newTitle
+        markModifiedAsPending(at: idx)
         return true
     }
 
@@ -543,6 +552,7 @@ public struct ParsedPlan: Codable, Sendable, Equatable {
         guard let idx = items.firstIndex(where: { $0.id == id }),
               items[idx].location != newLocation else { return false }
         items[idx].location = newLocation
+        markModifiedAsPending(at: idx)
         return true
     }
 
@@ -551,6 +561,7 @@ public struct ParsedPlan: Codable, Sendable, Equatable {
         guard let idx = items.firstIndex(where: { $0.id == id }),
               items[idx].notes != newNotes else { return false }
         items[idx].notes = newNotes
+        markModifiedAsPending(at: idx)
         return true
     }
 
@@ -559,6 +570,7 @@ public struct ParsedPlan: Codable, Sendable, Equatable {
         guard let idx = items.firstIndex(where: { $0.id == id }),
               items[idx].category != newCategory else { return false }
         items[idx].category = newCategory
+        markModifiedAsPending(at: idx)
         return true
     }
 
@@ -583,6 +595,7 @@ public struct ParsedPlan: Codable, Sendable, Equatable {
         } else if items[idx].targetKind == .alarm {
             items[idx].alarmTimeISO = newISO
         }
+        markModifiedAsPending(at: idx)
         return true
     }
 
@@ -592,6 +605,7 @@ public struct ParsedPlan: Codable, Sendable, Equatable {
         let newISO = PromptBuilder.formatISODate(newDate)
         guard items[idx].endISO != newISO else { return false }
         items[idx].endISO = newISO
+        markModifiedAsPending(at: idx)
         return true
     }
 
@@ -600,6 +614,7 @@ public struct ParsedPlan: Codable, Sendable, Equatable {
         guard let idx = items.firstIndex(where: { $0.id == id }),
               items[idx].leadTimeMinutes != minutes else { return false }
         items[idx].leadTimeMinutes = minutes
+        markModifiedAsPending(at: idx)
         return true
     }
 
@@ -607,6 +622,7 @@ public struct ParsedPlan: Codable, Sendable, Equatable {
     public mutating func toggleItemPriority(id: UUID) -> Bool {
         guard let idx = items.firstIndex(where: { $0.id == id }) else { return false }
         items[idx].priority = (items[idx].priority == 1) ? 0 : 1
+        markModifiedAsPending(at: idx)
         return true
     }
 

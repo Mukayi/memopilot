@@ -1,4 +1,5 @@
 import Foundation
+import AppKit
 
 public struct WatchedAppleNote: Codable, Sendable, Equatable, Identifiable {
     public var id: String
@@ -63,7 +64,12 @@ public final class AppleNotesWatcherService: @unchecked Sendable {
         }
     }
 
-    public func fetchUnprocessedNotes() async throws -> [WatchedAppleNote] {
+    public func fetchUnprocessedNotes(allowLaunchingNotesApp: Bool = false) async throws -> [WatchedAppleNote] {
+        if !allowLaunchingNotesApp {
+            let isNotesRunning = !NSRunningApplication.runningApplications(withBundleIdentifier: "com.apple.Notes").isEmpty
+            guard isNotesRunning else { return [] }
+        }
+
         let canProceed: Bool = lock.withLock {
             if isScanning { return false }
             isScanning = true
@@ -76,28 +82,40 @@ public final class AppleNotesWatcherService: @unchecked Sendable {
 
         return try await Task.detached(priority: .utility) {
             let jxaScript = """
-            const Notes = Application("Notes");
-            const acc = Notes.defaultAccount();
-            let folder = acc.folders.byName("MemoPilot");
-            try { folder.id(); } catch (e) {
-                folder = Notes.Folder({name: "MemoPilot"});
-                acc.folders.push(folder);
+            function run(argv) {
+                const shouldCreate = (argv.length > 0 && argv[0] === "true");
+                const Notes = Application("Notes");
+                const acc = Notes.defaultAccount();
+                let folder = acc.folders.byName("MemoPilot");
+                try {
+                    folder.id();
+                } catch (e) {
+                    if (!shouldCreate) {
+                        return "[]";
+                    }
+                    folder = Notes.Folder({name: "MemoPilot"});
+                    acc.folders.push(folder);
+                }
+                const notes = folder.notes();
+                const result = [];
+                for (let i = 0; i < Math.min(notes.length, 20); i++) {
+                    const n = notes[i];
+                    result.push({
+                        id: String(n.id()),
+                        title: String(n.name() || ""),
+                        plaintext: String(n.plaintext() || ""),
+                        body: String(n.body() || "")
+                    });
+                }
+                return JSON.stringify(result);
             }
-            const notes = folder.notes();
-            const result = [];
-            for (let i = 0; i < Math.min(notes.length, 20); i++) {
-                const n = notes[i];
-                result.push({
-                    id: String(n.id()),
-                    title: String(n.name() || ""),
-                    plaintext: String(n.plaintext() || ""),
-                    body: String(n.body() || "")
-                });
-            }
-            JSON.stringify(result);
             """
 
-            let jsonOut = try Self.runJXAScript(jxaScript, arguments: [], timeout: 8.0)
+            let jsonOut = try Self.runJXAScript(
+                jxaScript,
+                arguments: [allowLaunchingNotesApp ? "true" : "false"],
+                timeout: 8.0
+            )
             guard let data = jsonOut.trimmingCharacters(in: .whitespacesAndNewlines).data(using: .utf8),
                   let allNotes = try? JSONDecoder().decode([WatchedAppleNote].self, from: data) else {
                 return []
@@ -118,21 +136,21 @@ public final class AppleNotesWatcherService: @unchecked Sendable {
             let safeSummary = AppleExecutors.htmlEscape(summary.isEmpty ? "已生成草稿" : summary)
             let stampHTML = "<br><hr><p><small>\(Self.processedMarker)：\(safeSummary)</small></p>"
             let jxaScript = """
-            ObjC.import('Foundation');
-            const args = $.NSProcessInfo.processInfo.arguments;
-            const targetID = ObjC.unwrap(args.objectAtIndex(4));
-            const stamp = ObjC.unwrap(args.objectAtIndex(5));
-            const Notes = Application("Notes");
-            const folder = Notes.defaultAccount().folders.byName("MemoPilot");
-            const notes = folder.notes();
-            for (let i = 0; i < notes.length; i++) {
-                const n = notes[i];
-                if (String(n.id()) === targetID) {
-                    const currentBody = String(n.body() || "");
-                    if (!currentBody.includes("\(Self.processedMarker)")) {
-                        n.body = currentBody + stamp;
+            function run(argv) {
+                const targetID = argv[0] || "";
+                const stamp = argv[1] || "";
+                const Notes = Application("Notes");
+                const folder = Notes.defaultAccount().folders.byName("MemoPilot");
+                const notes = folder.notes();
+                for (let i = 0; i < notes.length; i++) {
+                    const n = notes[i];
+                    if (String(n.id()) === targetID) {
+                        const currentBody = String(n.body() || "");
+                        if (!currentBody.includes("\(Self.processedMarker)")) {
+                            n.body = currentBody + stamp;
+                        }
+                        break;
                     }
-                    break;
                 }
             }
             """

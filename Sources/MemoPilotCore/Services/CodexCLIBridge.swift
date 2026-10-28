@@ -27,7 +27,7 @@ public enum AISpeedProfile: String, CaseIterable, Identifiable, Sendable {
 
     public var codexReasoningEffort: String {
         switch self {
-        case .flash: return "minimal"
+        case .flash: return "low"
         case .balanced: return "low"
         case .deep: return "medium"
         }
@@ -171,7 +171,10 @@ public enum CodexCLIBridge {
 
     public static func isCodexAuthenticated(codexBinary: String?) -> Bool {
         let home = FileManager.default.homeDirectoryForCurrentUser.path
-        if FileManager.default.fileExists(atPath: "\(home)/.codex/auth.json") {
+        let authPath = "\(home)/.codex/auth.json"
+        if FileManager.default.fileExists(atPath: authPath),
+           let data = try? Data(contentsOf: URL(fileURLWithPath: authPath)),
+           data.count > 20 {
             return true
         }
         if let apiKey = ProcessInfo.processInfo.environment["OPENAI_API_KEY"], !apiKey.isEmpty {
@@ -288,22 +291,39 @@ public enum CodexCLIBridge {
 
             // 1. Run local Apple Vision OCR on background thread if image is attached
             var combinedText = userText
+            var ocrExtractedText = ""
             if let imagePath, !imagePath.isEmpty {
-                let ocrText = VisionOCRService.recognizeText(at: imagePath)
-                if !ocrText.isEmpty {
+                ocrExtractedText = VisionOCRService.recognizeText(at: imagePath).trimmingCharacters(in: .whitespacesAndNewlines)
+                if !ocrExtractedText.isEmpty {
                     combinedText = userText.isEmpty
-                        ? "【截图 OCR 识别文本】：\n\(ocrText)"
-                        : "\(userText)\n\n【附图 OCR 识别文本】：\n\(ocrText)"
+                        ? "【截图 OCR 识别文本】：\n\(ocrExtractedText)"
+                        : "\(userText)\n\n【附图 OCR 识别文本】：\n\(ocrExtractedText)"
                 }
             }
 
-            // 2. Try Cursor Agent Direct Connection first if preferred or in auto mode
+            let codexPath = findCodexBinary()
+            let codexLoggedIn = isCodexAuthenticated(codexBinary: codexPath)
+
+            // If user only attached an image, OCR extracted 0 text, and multimodal Codex is not logged in (or user forced Cursor mode), fail fast with clear OCR message!
             let hasUsableTextForCursor = !combinedText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+            if !hasUsableTextForCursor && imagePath != nil && (preferredMode == .cursor || !codexLoggedIn) {
+                throw NSError(
+                    domain: "MemoPilot.AI",
+                    code: 422,
+                    userInfo: [NSLocalizedDescriptionKey: "未能从截图中识别出清晰文字，请重新框选包含文字的区域或直接输入文字。"]
+                )
+            }
+
+            // 2. Try Cursor Agent Direct Connection first if preferred or in auto mode
+            // Note: cursor-agent is text-based; if an image was attached and OCR returned empty, only use cursor-agent if codex multimodal is unavailable
+            var cursorAttemptError: Error?
+            let canUseCursorForImage = (imagePath == nil) || !ocrExtractedText.isEmpty || !codexLoggedIn
             if preferredMode != .openai,
                hasUsableTextForCursor,
+               canUseCursorForImage,
                let cursorBin = findCursorAgentBinary(),
                let cursorKey = discoverCursorApiKey() {
-                let prompt = PromptBuilder.buildPrompt(userText: combinedText, hasImage: imagePath != nil)
+                let prompt = PromptBuilder.buildPrompt(userText: combinedText, hasImage: !ocrExtractedText.isEmpty)
                 let schemaInstruction = "\n\n请只输出一个合法的 JSON 对象（不要调用任何工具，不要用 markdown 代码块包裹，不要任何多余解释），必须严格包含 summary, events, reminders, notes 四个顶级字段，结构遵循：\n\(PromptBuilder.outputJSONSchema)"
                 let fullPrompt = prompt + schemaInstruction
 
@@ -317,6 +337,7 @@ public enum CodexCLIBridge {
                             "--model", speedProfile.cursorModelSlug,
                             "-p",
                             "--mode", "ask",
+                            "--",
                             fullPrompt
                         ],
                         workingDirectoryURL: tempDir,
@@ -324,22 +345,19 @@ public enum CodexCLIBridge {
                     )
                     return try ParsedPlan.decode(from: output)
                 } catch {
+                    cursorAttemptError = error
                     UserDefaults.standard.removeObject(forKey: "MemoPilot.cachedCursorApiKey")
                     if preferredMode == .cursor {
                         throw error
                     }
-                    // In .auto mode, fall through to OpenAI Codex CLI if available
+                    // In .auto mode, fall through to OpenAI Codex CLI only if Codex is authenticated
                 }
             }
 
             // 3. Fallback to OpenAI Codex CLI
-            guard let codexPath = findCodexBinary() else {
-                if !hasUsableTextForCursor && imagePath != nil {
-                    throw NSError(
-                        domain: "MemoPilot.AI",
-                        code: 422,
-                        userInfo: [NSLocalizedDescriptionKey: "未能从截图中识别出清晰文字，请重新框选包含文字的区域或直接输入文字。"]
-                    )
+            guard let codexPath else {
+                if let cursorAttemptError {
+                    throw cursorAttemptError
                 }
                 throw NSError(
                     domain: "MemoPilot.AI",
@@ -348,8 +366,11 @@ public enum CodexCLIBridge {
                 )
             }
 
-            // Verify Codex is actually logged in before running `codex exec` (prevents 90s unauthenticated retry loop)
-            guard isCodexAuthenticated(codexBinary: codexPath) else {
+            guard codexLoggedIn else {
+                // If we already tried Cursor in .auto mode and it failed, surface the actual Cursor error rather than a misleading "not logged into OpenAI" error!
+                if let cursorAttemptError {
+                    throw cursorAttemptError
+                }
                 throw NSError(
                     domain: "MemoPilot.CodexAuth",
                     code: 401,
@@ -400,13 +421,14 @@ public enum CodexCLIBridge {
         prompt: String,
         speedProfile: AISpeedProfile = .flash
     ) -> [String] {
+        // Use `-c mcp_servers={}` instead of `--ignore-user-config` so user's custom auth/provider settings in config.toml
+        // are preserved while still disabling heavy desktop MCP servers (like node_repl 120s timeout).
         var args: [String] = [
             "exec",
-            "--ignore-user-config",
             "--ephemeral",
             "-C", tempDirPath,
+            "-c", "mcp_servers={}",
             "-c", "model_reasoning_effort=\"\(speedProfile.codexReasoningEffort)\"",
-            "--enable", "respect_system_proxy",
             "--disable", "shell_tool",
             "--disable", "shell_snapshot",
             "--disable", "plugins",
@@ -444,7 +466,6 @@ public enum CodexCLIBridge {
 
         var env = ProcessInfo.processInfo.environment
         env["PATH"] = augmentedPATH()
-        // Inject macOS System Proxy if not already set in environment
         for (k, v) in systemProxyEnvironment() where env[k] == nil {
             env[k] = v
         }

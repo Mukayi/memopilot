@@ -12,21 +12,33 @@ public struct ClipboardPayload: Sendable, Equatable {
 }
 
 public enum ClipboardService {
+    private static let supportedImageExtensions: Set<String> = ["png", "jpg", "jpeg", "heic", "webp", "tiff", "bmp", "gif"]
+
     @MainActor
     public static func readPayload() -> ClipboardPayload? {
         let pb = NSPasteboard.general
 
-        // 1. Check for text on the pasteboard
-        if let rawString = pb.string(forType: .string) {
-            let trimmed = rawString.trimmingCharacters(in: .whitespacesAndNewlines)
-            if !trimmed.isEmpty {
-                return ClipboardPayload(text: trimmed, imagePath: nil)
+        // 1. If the user copied an image file in Finder, Finder also puts the filename in .string.
+        //    Check for copied file URLs first so we use the actual image file rather than its filename string!
+        if let fileURLs = pb.readObjects(forClasses: [NSURL.self], options: [.urlReadingFileURLsOnly: true]) as? [URL],
+           !fileURLs.isEmpty {
+            if let firstImageURL = fileURLs.first(where: {
+                supportedImageExtensions.contains($0.pathExtension.lowercased())
+            }), FileManager.default.fileExists(atPath: firstImageURL.path) {
+                return ClipboardPayload(text: "", imagePath: firstImageURL.path)
             }
+            // Non-image file copied in Finder: do not rasterize its Finder file icon as an image
+            return nil
         }
 
-        // 2. Check for an image on the pasteboard (e.g. copied image from WeChat)
-        if let imagePath = readImageFromPasteboardIfPresent() {
-            return ClipboardPayload(text: "", imagePath: imagePath)
+        // 2. Check for copied bitmap image data (e.g. screenshot or copied image from WeChat)
+        let imagePath = readBitmapImageFromPasteboardIfPresent(pb)
+
+        // 3. Check for plain text on the pasteboard
+        let trimmedText = pb.string(forType: .string)?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+
+        if !trimmedText.isEmpty || imagePath != nil {
+            return ClipboardPayload(text: trimmedText, imagePath: imagePath)
         }
 
         return nil
@@ -36,14 +48,24 @@ public enum ClipboardService {
     public static func readImageFromPasteboardIfPresent() -> String? {
         let pb = NSPasteboard.general
         if let fileURLs = pb.readObjects(forClasses: [NSURL.self], options: [.urlReadingFileURLsOnly: true]) as? [URL],
-           let firstImageURL = fileURLs.first(where: {
-               ["png", "jpg", "jpeg", "heic", "webp", "tiff"].contains($0.pathExtension.lowercased())
-           }),
-           FileManager.default.fileExists(atPath: firstImageURL.path) {
-            return firstImageURL.path
+           !fileURLs.isEmpty {
+            if let firstImageURL = fileURLs.first(where: {
+                supportedImageExtensions.contains($0.pathExtension.lowercased())
+            }), FileManager.default.fileExists(atPath: firstImageURL.path) {
+                return firstImageURL.path
+            }
+            return nil
         }
+        return readBitmapImageFromPasteboardIfPresent(pb)
+    }
 
-        guard let image = NSImage(pasteboard: pb) else { return nil }
+    @MainActor
+    private static func readBitmapImageFromPasteboardIfPresent(_ pb: NSPasteboard) -> String? {
+        let imageTypes: [NSPasteboard.PasteboardType] = [.png, .tiff]
+        guard pb.availableType(from: imageTypes) != nil,
+              let image = NSImage(pasteboard: pb) else {
+            return nil
+        }
         return saveNSImageToTempPNG(image)
     }
 

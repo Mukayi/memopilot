@@ -108,9 +108,11 @@ public final class AppleExecutors: @unchecked Sendable {
                 if let date = parsedDate {
                     let epochMs = Int64(date.timeIntervalSince1970 * 1000.0)
                     let jxa = """
-                    const Cal = Application("Calendar");
-                    Cal.activate();
-                    Cal.viewCalendar({at: new Date(\(epochMs))});
+                    function run(argv) {
+                        const Cal = Application("Calendar");
+                        Cal.activate();
+                        Cal.viewCalendar({at: new Date(\(epochMs))});
+                    }
                     """
                     Self.runQuickJXA(jxa, arguments: [])
                 }
@@ -118,54 +120,77 @@ public final class AppleExecutors: @unchecked Sendable {
             case .reminder, .alarm:
                 let searchTitle = (kind == .alarm && !title.hasPrefix("⏰")) ? "⏰ 【闹钟】\(title)" : title
                 let jxa = """
-                ObjC.import('Foundation');
-                const args = $.NSProcessInfo.processInfo.arguments;
-                const targetID = ObjC.unwrap(args.objectAtIndex(4));
-                const targetTitle = ObjC.unwrap(args.objectAtIndex(5));
-                const Rem = Application("Reminders");
-                Rem.activate();
-                try {
+                function run(argv) {
+                    const targetID = argv[0] || "";
+                    const targetTitle = argv[1] || "";
+                    const Rem = Application("Reminders");
+                    Rem.activate();
                     if (targetID.length > 0) {
-                        Rem.reminders.byId(targetID).show();
-                    } else if (targetTitle.length > 0) {
-                        const found = Rem.reminders.whose({name: targetTitle})();
-                        if (found.length > 0) { found[0].show(); }
+                        try {
+                            const fullID = targetID.startsWith("x-apple-reminderkit://")
+                                ? targetID
+                                : ("x-apple-reminderkit://REMCDReminder/" + targetID);
+                            Rem.reminders.byId(fullID).show();
+                            return;
+                        } catch (e) {}
                     }
-                } catch (e) {}
+                    if (targetTitle.length > 0) {
+                        try {
+                            const found = Rem.reminders.whose({name: targetTitle})();
+                            if (found.length > 0) { found[0].show(); }
+                        } catch (e) {}
+                    }
+                }
                 """
                 Self.runQuickJXA(jxa, arguments: [extID, searchTitle])
 
             case .note:
                 let jxa = """
-                ObjC.import('Foundation');
-                const args = $.NSProcessInfo.processInfo.arguments;
-                const targetID = ObjC.unwrap(args.objectAtIndex(4));
-                const targetTitle = ObjC.unwrap(args.objectAtIndex(5));
-                const Notes = Application("Notes");
-                Notes.activate();
-                try {
+                function run(argv) {
+                    const targetID = argv[0] || "";
+                    const targetTitle = argv[1] || "";
+                    const Notes = Application("Notes");
+                    Notes.activate();
                     if (targetID.length > 0) {
-                        Notes.notes.byId(targetID).show();
-                    } else if (targetTitle.length > 0) {
-                        const found = Notes.notes.whose({name: targetTitle})();
-                        if (found.length > 0) { found[0].show(); }
+                        try {
+                            Notes.notes.byId(targetID).show();
+                            return;
+                        } catch (e) {}
                     }
-                } catch (e) {}
+                    if (targetTitle.length > 0) {
+                        try {
+                            const found = Notes.notes.whose({name: targetTitle})();
+                            if (found.length > 0) { found[0].show(); }
+                        } catch (e) {}
+                    }
+                }
                 """
                 Self.runQuickJXA(jxa, arguments: [extID, title])
             }
         }
     }
 
-    private static func runQuickJXA(_ script: String, arguments: [String]) {
+    private static func runQuickJXA(_ script: String, arguments: [String], timeout: TimeInterval = 6.0) {
         let process = Process()
         process.executableURL = URL(fileURLWithPath: "/usr/bin/osascript")
         process.arguments = ["-l", "JavaScript", "-e", script] + arguments
         process.standardInput = FileHandle.nullDevice
         process.standardOutput = FileHandle.nullDevice
         process.standardError = FileHandle.nullDevice
-        try? process.run()
-        process.waitUntilExit()
+
+        do {
+            try process.run()
+        } catch {
+            return
+        }
+
+        let deadline = Date().addingTimeInterval(timeout)
+        while process.isRunning && Date() < deadline {
+            Thread.sleep(forTimeInterval: 0.04)
+        }
+        if process.isRunning {
+            process.terminate()
+        }
     }
 
     // MARK: - Calendar Time Conflict Detection
@@ -186,7 +211,7 @@ public final class AppleExecutors: @unchecked Sendable {
                 }
                 let pred = eventStore.predicateForEvents(withStart: start, end: end, calendars: nil)
                 let overlapping = eventStore.events(matching: pred).filter { ev in
-                    !ev.isAllDay && ev.title != item.title && ev.endDate > start && ev.startDate < end
+                    !ev.isAllDay && ev.endDate > start && ev.startDate < end
                 }
                 if let firstConflict = overlapping.first, let conflictTitle = firstConflict.title, !conflictTitle.isEmpty {
                     conflicts[item.id] = conflictTitle
@@ -200,10 +225,13 @@ public final class AppleExecutors: @unchecked Sendable {
 
     public func deleteFromSystem(item: DraftItem) async -> String {
         let extID = item.createdExternalID ?? ""
-        let title = item.title
+        let title = item.title.trimmingCharacters(in: .whitespacesAndNewlines)
 
         switch item.targetKind {
         case .calendar:
+            if EKEventStore.authorizationStatus(for: .event) != .fullAccess {
+                _ = try? await eventStore.requestFullAccessToEvents()
+            }
             var removedCount = 0
             lock.withLock {
                 if !extID.isEmpty {
@@ -214,7 +242,7 @@ public final class AppleExecutors: @unchecked Sendable {
                         }
                     }
                 }
-                if removedCount == 0, let startDate = PromptBuilder.parseISODate(item.startISO) {
+                if removedCount == 0, !title.isEmpty, let startDate = PromptBuilder.parseISODate(item.startISO) {
                     let pred = eventStore.predicateForEvents(
                         withStart: startDate.addingTimeInterval(-3600),
                         end: startDate.addingTimeInterval(86400),
@@ -229,6 +257,9 @@ public final class AppleExecutors: @unchecked Sendable {
             return "🗑️ 已从系统「日历」中删除「\(title)」"
 
         case .reminder, .alarm:
+            if EKEventStore.authorizationStatus(for: .reminder) != .fullAccess {
+                _ = try? await eventStore.requestFullAccessToReminders()
+            }
             await MainActor.run {
                 LocalAlarmScheduler.shared.cancelAlarm(id: item.id)
             }
@@ -245,6 +276,7 @@ public final class AppleExecutors: @unchecked Sendable {
                     }
                 }
                 if item.targetKind == .alarm,
+                   !title.isEmpty,
                    let alarmDate = PromptBuilder.parseISODate(item.startISO.isEmpty ? item.alarmTimeISO : item.startISO) {
                     let pred = eventStore.predicateForEvents(
                         withStart: alarmDate.addingTimeInterval(-1800),
@@ -259,25 +291,32 @@ public final class AppleExecutors: @unchecked Sendable {
 
             await Task.detached(priority: .userInitiated) {
                 let jxa = """
-                ObjC.import('Foundation');
-                const args = $.NSProcessInfo.processInfo.arguments;
-                const targetID = ObjC.unwrap(args.objectAtIndex(4));
-                const targetTitle = ObjC.unwrap(args.objectAtIndex(5));
-                const rawTitle = ObjC.unwrap(args.objectAtIndex(6));
-                const Rem = Application("Reminders");
-                try {
+                function run(argv) {
+                    const targetID = argv[0] || "";
+                    const targetTitle = argv[1] || "";
+                    const rawTitle = argv[2] || "";
+                    const Rem = Application("Reminders");
                     if (targetID.length > 0) {
-                        Rem.delete(Rem.reminders.byId(targetID));
+                        try {
+                            const fullID = targetID.startsWith("x-apple-reminderkit://")
+                                ? targetID
+                                : ("x-apple-reminderkit://REMCDReminder/" + targetID);
+                            Rem.delete(Rem.reminders.byId(fullID));
+                        } catch (e) {}
                     }
-                } catch (e) {}
-                try {
-                    const list1 = Rem.reminders.whose({name: targetTitle})();
-                    for (let i = 0; i < list1.length; i++) { Rem.delete(list1[i]); }
-                    if (rawTitle !== targetTitle) {
-                        const list2 = Rem.reminders.whose({name: rawTitle})();
-                        for (let i = 0; i < list2.length; i++) { Rem.delete(list2[i]); }
+                    if (targetTitle.length > 0) {
+                        try {
+                            const list1 = Rem.reminders.whose({name: targetTitle})();
+                            for (let i = 0; i < list1.length; i++) { Rem.delete(list1[i]); }
+                        } catch (e) {}
                     }
-                } catch (e) {}
+                    if (rawTitle.length > 0 && rawTitle !== targetTitle) {
+                        try {
+                            const list2 = Rem.reminders.whose({name: rawTitle})();
+                            for (let i = 0; i < list2.length; i++) { Rem.delete(list2[i]); }
+                        } catch (e) {}
+                    }
+                }
                 """
                 Self.runQuickJXA(jxa, arguments: [extID, alarmTitle, title])
             }.value
@@ -287,21 +326,23 @@ public final class AppleExecutors: @unchecked Sendable {
         case .note:
             await Task.detached(priority: .userInitiated) {
                 let jxa = """
-                ObjC.import('Foundation');
-                const args = $.NSProcessInfo.processInfo.arguments;
-                const targetID = ObjC.unwrap(args.objectAtIndex(4));
-                const targetTitle = ObjC.unwrap(args.objectAtIndex(5));
-                const Notes = Application("Notes");
-                try {
+                function run(argv) {
+                    const targetID = argv[0] || "";
+                    const targetTitle = argv[1] || "";
+                    const Notes = Application("Notes");
                     if (targetID.length > 0) {
-                        Notes.delete(Notes.notes.byId(targetID));
-                        return;
+                        try {
+                            Notes.delete(Notes.notes.byId(targetID));
+                            return;
+                        } catch (e) {}
                     }
-                } catch (e) {}
-                try {
-                    const found = Notes.notes.whose({name: targetTitle})();
-                    if (found.length > 0) { Notes.delete(found[0]); }
-                } catch (e) {}
+                    if (targetTitle.length > 0) {
+                        try {
+                            const found = Notes.notes.whose({name: targetTitle})();
+                            if (found.length > 0) { Notes.delete(found[0]); }
+                        } catch (e) {}
+                    }
+                }
                 """
                 Self.runQuickJXA(jxa, arguments: [extID, title])
             }.value
@@ -314,7 +355,6 @@ public final class AppleExecutors: @unchecked Sendable {
     public func execute(plan: ParsedPlan) async -> ExecutionReport {
         var report = ExecutionReport()
 
-        // Strictly filter to uncommitted (!isCommitted) & selected items to prevent duplicate writes!
         let pendingSelected = plan.pendingItems.filter(\.isSelected)
         let selectedEvents = pendingSelected.filter { $0.targetKind == .calendar }.map { $0.asCalendarEventDraft() }
         let selectedReminders = pendingSelected.filter { $0.targetKind == .reminder }.map { $0.asReminderDraft() }
@@ -482,7 +522,6 @@ public final class AppleExecutors: @unchecked Sendable {
             let endDate = PromptBuilder.parseISODate(draft.endISO) ?? startDate.addingTimeInterval(3600)
             let finalEndDate = endDate > startDate ? endDate : startDate.addingTimeInterval(1800)
 
-            // EventKit Deduplication Guard: if an event with identical title & start time already exists, do not duplicate!
             let dupPred = eventStore.predicateForEvents(
                 withStart: startDate.addingTimeInterval(-60),
                 end: finalEndDate.addingTimeInterval(60),
@@ -563,63 +602,80 @@ public final class AppleExecutors: @unchecked Sendable {
 
     private func createAppleNoteAsync(from draft: KeyNoteDraft) async throws -> String? {
         try await Task.detached(priority: .userInitiated) {
-            let safeTitle = Self.htmlEscape(draft.title)
-            let safeCategory = Self.htmlEscape(draft.category)
-            let htmlBody = Self.htmlEscape(draft.bodyMarkdown)
-                .replacingOccurrences(of: "\r\n", with: "<br>")
-                .replacingOccurrences(of: "\n", with: "<br>")
-
-            let fullHTML = "<h1>\(safeTitle)</h1><p><em>分类：\(safeCategory)</em></p><hr><p>\(htmlBody)</p>"
-
-            // Deduplicating AppleScript: if a note with the exact same title already exists, update it instead of creating a duplicate
-            let script = """
-            on run argv
-                set noteTitle to item 1 of argv
-                set noteBody to item 2 of argv
-                tell application "Notes"
-                    tell default account
-                        try
-                            set existingNotes to (every note of default folder whose name is noteTitle)
-                            if (count of existingNotes) > 0 then
-                                set existingNote to item 1 of existingNotes
-                                set body of existingNote to noteBody
-                                return id of existingNote
-                            end if
-                            set createdNote to make new note at default folder with properties {name:noteTitle, body:noteBody}
-                            return id of createdNote
-                        on error
-                            set createdNote to make new note with properties {name:noteTitle, body:noteBody}
-                            return id of createdNote
-                        end try
-                    end tell
-                end tell
-            end run
-            """
-
-            let process = Process()
-            process.executableURL = URL(fileURLWithPath: "/usr/bin/osascript")
-            process.arguments = ["-e", script, draft.title, fullHTML]
-            process.standardInput = FileHandle.nullDevice
-
-            let outPipe = Pipe()
-            let errPipe = Pipe()
-            process.standardOutput = outPipe
-            process.standardError = errPipe
-
-            try process.run()
-            let outData = outPipe.fileHandleForReading.readDataToEndOfFile()
-            let errData = errPipe.fileHandleForReading.readDataToEndOfFile()
-            process.waitUntilExit()
-
-            if process.terminationStatus != 0 {
-                let errMsg = String(data: errData, encoding: .utf8)?.trimmingCharacters(in: .whitespacesAndNewlines) ?? "未知 AppleScript 错误"
-                throw NSError(
-                    domain: "MemoPilot.Notes",
-                    code: Int(process.terminationStatus),
-                    userInfo: [NSLocalizedDescriptionKey: errMsg]
-                )
-            }
-            return String(data: outData, encoding: .utf8)?.trimmingCharacters(in: .whitespacesAndNewlines)
+            try Self.createAppleNoteSync(from: draft)
         }.value
+    }
+
+    private static func createAppleNoteSync(from draft: KeyNoteDraft) throws -> String? {
+        let safeTitle = htmlEscape(draft.title)
+        let safeCategory = htmlEscape(draft.category)
+        let htmlBody = htmlEscape(draft.bodyMarkdown)
+            .replacingOccurrences(of: "\r\n", with: "<br>")
+            .replacingOccurrences(of: "\n", with: "<br>")
+
+        let fullHTML = "<h1>\(safeTitle)</h1><p><em>分类：\(safeCategory)</em></p><hr><p>\(htmlBody)</p>"
+
+        let script = """
+        on run argv
+            set noteTitle to item 1 of argv
+            set noteBody to item 2 of argv
+            tell application "Notes"
+                tell default account
+                    try
+                        set createdNote to make new note at default folder with properties {name:noteTitle, body:noteBody}
+                        return id of createdNote
+                    on error
+                        set createdNote to make new note with properties {name:noteTitle, body:noteBody}
+                        return id of createdNote
+                    end try
+                end tell
+            end tell
+        end run
+        """
+
+        let process = Process()
+        process.executableURL = URL(fileURLWithPath: "/usr/bin/osascript")
+        process.arguments = ["-e", script, draft.title, fullHTML]
+        process.standardInput = FileHandle.nullDevice
+
+        let outPipe = Pipe()
+        let errPipe = Pipe()
+        process.standardOutput = outPipe
+        process.standardError = errPipe
+
+        try process.run()
+
+        let group = DispatchGroup()
+        nonisolated(unsafe) var outData = Data()
+        nonisolated(unsafe) var errData = Data()
+
+        group.enter()
+        DispatchQueue.global(qos: .userInitiated).async {
+            outData = outPipe.fileHandleForReading.readDataToEndOfFile()
+            group.leave()
+        }
+
+        group.enter()
+        DispatchQueue.global(qos: .userInitiated).async {
+            errData = errPipe.fileHandleForReading.readDataToEndOfFile()
+            group.leave()
+        }
+
+        if group.wait(timeout: .now() + 10.0) == .timedOut {
+            process.terminate()
+            throw NSError(domain: "MemoPilot.Notes", code: -1, userInfo: [NSLocalizedDescriptionKey: "写入备忘录超时"])
+        }
+
+        process.waitUntilExit()
+
+        if process.terminationStatus != 0 {
+            let errMsg = String(data: errData, encoding: .utf8)?.trimmingCharacters(in: .whitespacesAndNewlines) ?? "未知 AppleScript 错误"
+            throw NSError(
+                domain: "MemoPilot.Notes",
+                code: Int(process.terminationStatus),
+                userInfo: [NSLocalizedDescriptionKey: errMsg]
+            )
+        }
+        return String(data: outData, encoding: .utf8)?.trimmingCharacters(in: .whitespacesAndNewlines)
     }
 }
