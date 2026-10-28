@@ -1,4 +1,4 @@
-# MemoPilot 闪记领航
+# MemoPilot
 
 ![MemoPilot Hero Banner](Assets/MemoPilotHero.gif)
 

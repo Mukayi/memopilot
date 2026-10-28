@@ -81,8 +81,8 @@ struct HeroBannerFrameView: View {
                                 .tracking(1.6)
                                 .foregroundStyle(Color(red: 0.96, green: 0.73, blue: 0.32))
 
-                            Text("MemoPilot 闪记领航")
-                                .font(.system(size: 28, weight: .bold, design: .rounded))
+                            Text("MemoPilot")
+                                .font(.system(size: 30, weight: .bold, design: .rounded))
                                 .foregroundStyle(.white)
 
                             Text("记录零碎想法 · 识别微信截图 · 自动归档日历与提醒")
