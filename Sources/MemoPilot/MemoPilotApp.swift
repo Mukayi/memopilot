@@ -72,7 +72,13 @@ final class AppViewModel: ObservableObject {
         activeProviderLabel: "Cursor 已连接",
         statusMessage: "正在检测本地 AI 连接状态…"
     )
-    @Published var parsedPlan: ParsedPlan?
+    @Published var parsedPlan: ParsedPlan? {
+        didSet {
+            refreshCalendarConflicts()
+        }
+    }
+    @Published var calendarConflicts: [UUID: String] = [:]
+    @Published var isLaunchAtLoginEnabled: Bool = LaunchAtLoginService.isEnabled
     @Published var editingItemID: UUID?
     @Published var isShowingShortcutSettings: Bool = false
     @Published var hotKeyConfig: HotKeyConfiguration = HotKeyConfiguration.load()
@@ -98,12 +104,13 @@ final class AppViewModel: ObservableObject {
     private var notificationObserver: NSObjectProtocol?
     private var remotePollingTimer: Timer?
     private var notesWatchTimer: Timer?
+    private var pasteMonitor: Any?
     private var hasStartedListeners = false
     private var isHandlingRemote = false
 
     var selectedTotalCount: Int {
         guard let plan = parsedPlan else { return 0 }
-        return plan.items.filter(\.isSelected).count
+        return plan.pendingItems.filter(\.isSelected).count
     }
 
     var totalEventsInHistory: Int {
@@ -239,7 +246,52 @@ final class AppViewModel: ObservableObject {
         RunLoop.main.add(notesTimer, forMode: .common)
         notesWatchTimer = notesTimer
 
+        // Intercept Cmd+V when an image is on the pasteboard (e.g. copied screenshot from WeChat)
+        pasteMonitor = NSEvent.addLocalMonitorForEvents(matching: .keyDown) { [weak self] event in
+            let flags = event.modifierFlags.intersection([.command, .option, .control, .shift])
+            if flags == .command && event.charactersIgnoringModifiers?.lowercased() == "v" {
+                let pb = NSPasteboard.general
+                let hasText = !(pb.string(forType: .string)?.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty ?? true)
+                if !hasText, let imgPath = ClipboardService.readImageFromPasteboardIfPresent() {
+                    Task { @MainActor in
+                        self?.attachImageAndNotify(path: imgPath)
+                    }
+                    return nil
+                }
+            }
+            return event
+        }
+
         refreshCodexStatus()
+        refreshCalendarConflicts()
+    }
+
+    func toggleLaunchAtLogin() {
+        let next = !isLaunchAtLoginEnabled
+        LaunchAtLoginService.setEnabled(next)
+        isLaunchAtLoginEnabled = LaunchAtLoginService.isEnabled
+        isErrorBanner = false
+        statusBanner = isLaunchAtLoginEnabled ? "✅ 已开启开机自动启动" : "已关闭开机自动启动"
+    }
+
+    func refreshCalendarConflicts() {
+        guard let items = parsedPlan?.items else {
+            calendarConflicts = [:]
+            return
+        }
+        let detected = AppleExecutors.shared.detectCalendarConflicts(for: items)
+        if calendarConflicts != detected {
+            calendarConflicts = detected
+        }
+    }
+
+    func attachImageAndNotify(path: String) {
+        withAnimation(.easeInOut(duration: 0.18)) {
+            isInputCollapsed = false
+            attachedImagePath = path
+            isErrorBanner = false
+            statusBanner = "🖼️ 已粘贴/拖入图片，按 ⌘↩ 即可拆解"
+        }
     }
 
     func refreshCodexStatus() {
@@ -576,10 +628,22 @@ final class AppViewModel: ObservableObject {
         if editingItemID == id {
             editingItemID = nil
         }
-        guard var plan = parsedPlan else { return }
+        guard var plan = parsedPlan,
+              let targetItem = plan.item(id: id) else { return }
+
         plan.deleteItem(id: id)
         parsedPlan = plan
         syncCurrentPlanIntoSelectedRecord(plan, immediateSave: true)
+
+        if targetItem.isCommitted {
+            Task {
+                let msg = await AppleExecutors.shared.deleteFromSystem(item: targetItem)
+                withAnimation(.easeInOut(duration: 0.2)) {
+                    self.isErrorBanner = false
+                    self.statusBanner = msg
+                }
+            }
+        }
     }
 
     func addNewDraftItem(kind: DraftTargetKind = .reminder) {
@@ -633,6 +697,7 @@ final class AppViewModel: ObservableObject {
         guard let id = selectedRecordID,
               let idx = historyRecords.firstIndex(where: { $0.id == id }) else { return }
         historyRecords[idx].plan = plan
+        historyRecords[idx].isCommitted = !plan.items.isEmpty && plan.pendingItems.isEmpty
         if immediateSave {
             saveDebounceTask?.cancel()
             historyStore.saveAll(historyRecords)

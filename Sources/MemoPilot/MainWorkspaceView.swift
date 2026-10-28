@@ -1,5 +1,6 @@
 import SwiftUI
 import AppKit
+import UniformTypeIdentifiers
 import MemoPilotCore
 
 enum HistoryFilter: String, CaseIterable, Identifiable {
@@ -649,6 +650,15 @@ struct MainWorkspaceView: View {
                 Divider()
 
                 Button {
+                    viewModel.toggleLaunchAtLogin()
+                } label: {
+                    Label(
+                        viewModel.isLaunchAtLoginEnabled ? "已开启：开机自动启动" : "开启开机自动启动",
+                        systemImage: viewModel.isLaunchAtLoginEnabled ? "checkmark.circle.fill" : "power.circle"
+                    )
+                }
+
+                Button {
                     viewModel.autoCommit.toggle()
                 } label: {
                     Label(
@@ -772,7 +782,7 @@ struct MainWorkspaceView: View {
                 .padding(.leading, 2)
 
             TextField(
-                "输入备忘或粘贴微信聊天记录，按 ⌘↩ 智能拆解…",
+                "输入备忘、粘贴微信记录或图片 (⌘V / 拖拽图片)，按 ⌘↩ 拆解…",
                 text: $viewModel.inputText,
                 axis: .vertical
             )
@@ -780,6 +790,33 @@ struct MainWorkspaceView: View {
             .font(.system(size: 12.5))
             .lineLimit(1...3)
             .focused($isComposerFocused)
+
+            if let imgPath = viewModel.attachedImagePath {
+                HStack(spacing: 4) {
+                    Image(systemName: "photo.fill")
+                        .font(.system(size: 10))
+                        .foregroundStyle(palette.calendarTone)
+                    Text((imgPath as NSString).lastPathComponent)
+                        .font(.system(size: 10.5, weight: .medium))
+                        .foregroundStyle(.secondary)
+                        .lineLimit(1)
+                        .frame(maxWidth: 90)
+                    Button {
+                        viewModel.attachedImagePath = nil
+                    } label: {
+                        Image(systemName: "xmark.circle.fill")
+                            .font(.system(size: 10.5))
+                            .foregroundStyle(.tertiary)
+                    }
+                    .buttonStyle(.plain)
+                }
+                .padding(.horizontal, 7)
+                .frame(height: 22)
+                .background(
+                    RoundedRectangle(cornerRadius: 5, style: .continuous)
+                        .fill(palette.subtleButtonBg)
+                )
+            }
 
             if !viewModel.inputText.isEmpty {
                 Button {
@@ -853,6 +890,38 @@ struct MainWorkspaceView: View {
                         .strokeBorder(palette.hairline, lineWidth: 1)
                 )
         )
+        .onDrop(of: [.fileURL, .image], isTargeted: nil) { providers in
+            handleDroppedImageProviders(providers)
+        }
+    }
+
+    private func handleDroppedImageProviders(_ providers: [NSItemProvider]) -> Bool {
+        guard let first = providers.first else { return false }
+        if first.hasItemConformingToTypeIdentifier(UTType.fileURL.identifier) {
+            first.loadItem(forTypeIdentifier: UTType.fileURL.identifier, options: nil) { item, _ in
+                if let data = item as? Data,
+                   let url = URL(dataRepresentation: data, relativeTo: nil),
+                   ["png", "jpg", "jpeg", "heic", "webp", "tiff"].contains(url.pathExtension.lowercased()) {
+                    let path = url.path
+                    Task { @MainActor in
+                        viewModel.attachImageAndNotify(path: path)
+                    }
+                }
+            }
+            return true
+        }
+        if first.canLoadObject(ofClass: NSImage.self) {
+            first.loadObject(ofClass: NSImage.self) { obj, _ in
+                if let nsImage = obj as? NSImage,
+                   let savedPath = ClipboardService.saveNSImageToTempPNG(nsImage) {
+                    Task { @MainActor in
+                        viewModel.attachImageAndNotify(path: savedPath)
+                    }
+                }
+            }
+            return true
+        }
+        return false
     }
 
     private func statusBannerLine(_ text: String) -> some View {
@@ -1137,19 +1206,28 @@ struct MainWorkspaceView: View {
         )
 
         return HStack(alignment: .top, spacing: 0) {
-            // Col 1: 18pt Checkbox
-            Button {
-                viewModel.toggleItemSelection(id: item.id)
-            } label: {
-                Image(systemName: current.isSelected ? "checkmark.circle.fill" : "circle")
-                    .font(.system(size: 14.5))
-                    .foregroundStyle(current.isSelected ? Color.primary.opacity(0.75) : Color.secondary.opacity(0.32))
+            // Col 1: 18pt Status / Checkbox (Locked seal when already committed to prevent duplicate writes!)
+            if current.isCommitted {
+                Image(systemName: "checkmark.seal.fill")
+                    .font(.system(size: 13.5))
+                    .foregroundStyle(palette.committedTone)
                     .frame(width: 18, height: 20)
+                    .padding(.trailing, 10)
+                    .help("此项已写入系统（不会重复写入；点右侧垃圾桶可从系统删除）")
+            } else {
+                Button {
+                    viewModel.toggleItemSelection(id: item.id)
+                } label: {
+                    Image(systemName: current.isSelected ? "checkmark.circle.fill" : "circle")
+                        .font(.system(size: 14.5))
+                        .foregroundStyle(current.isSelected ? Color.primary.opacity(0.75) : Color.secondary.opacity(0.32))
+                        .frame(width: 18, height: 20)
+                }
+                .buttonStyle(.plain)
+                .padding(.trailing, 10)
             }
-            .buttonStyle(.plain)
-            .padding(.trailing, 10)
 
-            // Col 2: 44pt Pure SwiftUI Semantic Pill (Zero NSPopUpButton truncation!)
+            // Col 2: 44pt Pure SwiftUI Semantic Pill
             Button {
                 isPopoverOpen.wrappedValue.toggle()
             } label: {
@@ -1168,14 +1246,14 @@ struct MainWorkspaceView: View {
 
             // Col 3: Starts at exact X = 84pt
             VStack(alignment: .leading, spacing: 3.5) {
-                // Line 1: Clean Title + at most ONE subtle action on right
+                // Line 1: Clean Title + Open / Delete Actions
                 HStack(alignment: .center, spacing: 8) {
                     Button {
                         isPopoverOpen.wrappedValue.toggle()
                     } label: {
                         Text(current.title.isEmpty ? "未命名事项" : current.title)
                             .font(.system(size: 13, weight: .semibold))
-                            .foregroundStyle(current.isCommitted && !current.isSelected ? .secondary : .primary)
+                            .foregroundStyle(current.isCommitted ? .secondary : .primary)
                             .lineLimit(1)
                     }
                     .buttonStyle(.plain)
@@ -1208,31 +1286,43 @@ struct MainWorkspaceView: View {
                     Button {
                         viewModel.deleteDraftItem(id: item.id)
                     } label: {
-                        Image(systemName: "xmark")
+                        Image(systemName: current.isCommitted ? "trash" : "xmark")
                             .font(.system(size: 9.5, weight: .medium))
-                            .foregroundStyle(.tertiary)
+                            .foregroundStyle(current.isCommitted ? palette.urgentTone.opacity(0.85) : Color.secondary.opacity(0.45))
                             .frame(width: 19, height: 19)
                     }
                     .buttonStyle(.plain)
                     .fixedSize()
-                    .help("删除此项")
+                    .help(current.isCommitted ? "一键从系统「\(current.targetKind.systemAppName)」中删除此项" : "删除此条草稿")
                 }
 
-                // Line 2: Pure SwiftUI Single-Line Summary (100% aligned baseline)
+                // Line 2: Pure SwiftUI Single-Line Summary + Subtle Conflict Hint
                 Button {
                     isPopoverOpen.wrappedValue.toggle()
                 } label: {
-                    Text(summaryDetailLine(for: current))
-                        .font(.system(size: 11.5))
-                        .foregroundStyle(.secondary)
-                        .lineLimit(1)
-                        .frame(maxWidth: .infinity, alignment: .leading)
+                    HStack(alignment: .center, spacing: 6) {
+                        if let conflictTitle = viewModel.calendarConflicts[current.id], !current.isCommitted {
+                            Text("⚠️ 与「\(conflictTitle)」时间重叠")
+                                .font(.system(size: 11, weight: .medium))
+                                .foregroundStyle(palette.reminderTone)
+                                .fixedSize()
+                            Text("·")
+                                .font(.system(size: 11))
+                                .foregroundStyle(.tertiary)
+                        }
+
+                        Text(summaryDetailLine(for: current))
+                            .font(.system(size: 11.5))
+                            .foregroundStyle(.secondary)
+                            .lineLimit(1)
+                            .frame(maxWidth: .infinity, alignment: .leading)
+                    }
                 }
                 .buttonStyle(.plain)
             }
         }
         .padding(.vertical, 10.5)
-        .opacity(current.isSelected ? 1.0 : (current.isCommitted ? 0.72 : 0.45))
+        .opacity(current.isCommitted ? 0.78 : (current.isSelected ? 1.0 : 0.45))
         .popover(isPresented: isPopoverOpen, arrowEdge: .trailing) {
             draftEditorPopover(item: current)
         }
@@ -1266,7 +1356,10 @@ struct MainWorkspaceView: View {
             Button(role: .destructive) {
                 viewModel.deleteDraftItem(id: item.id)
             } label: {
-                Label("删除此项", systemImage: "trash")
+                Label(
+                    current.isCommitted ? "从系统「\(current.targetKind.systemAppName)」中删除此项" : "删除此条草稿",
+                    systemImage: "trash"
+                )
             }
         }
     }

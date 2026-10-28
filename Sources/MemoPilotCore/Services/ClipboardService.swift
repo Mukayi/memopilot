@@ -25,20 +25,41 @@ public enum ClipboardService {
         }
 
         // 2. Check for an image on the pasteboard (e.g. copied image from WeChat)
-        if let image = NSImage(pasteboard: pb),
-           let tiff = image.tiffRepresentation,
-           let rep = NSBitmapImageRep(data: tiff),
-           let pngData = rep.representation(using: .png, properties: [:]) {
-            let outputURL = FileManager.default.temporaryDirectory
-                .appendingPathComponent("MemoPilot-Capture-\(UUID().uuidString).png")
-            do {
-                try pngData.write(to: outputURL, options: .atomic)
-                return ClipboardPayload(text: "", imagePath: outputURL.path)
-            } catch {
-                return nil
-            }
+        if let imagePath = readImageFromPasteboardIfPresent() {
+            return ClipboardPayload(text: "", imagePath: imagePath)
         }
 
         return nil
+    }
+
+    @MainActor
+    public static func readImageFromPasteboardIfPresent() -> String? {
+        let pb = NSPasteboard.general
+        if let fileURLs = pb.readObjects(forClasses: [NSURL.self], options: [.urlReadingFileURLsOnly: true]) as? [URL],
+           let firstImageURL = fileURLs.first(where: {
+               ["png", "jpg", "jpeg", "heic", "webp", "tiff"].contains($0.pathExtension.lowercased())
+           }),
+           FileManager.default.fileExists(atPath: firstImageURL.path) {
+            return firstImageURL.path
+        }
+
+        guard let image = NSImage(pasteboard: pb) else { return nil }
+        return saveNSImageToTempPNG(image)
+    }
+
+    public static func saveNSImageToTempPNG(_ image: NSImage) -> String? {
+        guard let tiff = image.tiffRepresentation,
+              let rep = NSBitmapImageRep(data: tiff),
+              let pngData = rep.representation(using: .png, properties: [:]) else {
+            return nil
+        }
+        let outputURL = FileManager.default.temporaryDirectory
+            .appendingPathComponent("MemoPilot-Capture-\(UUID().uuidString).png")
+        do {
+            try pngData.write(to: outputURL, options: .atomic)
+            return outputURL.path
+        } catch {
+            return nil
+        }
     }
 }

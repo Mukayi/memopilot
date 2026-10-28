@@ -21,7 +21,7 @@ public struct ExecutionReport: Sendable {
         if !triggeredAlarms.isEmpty && createdAlarmsCount == 0 {
             parts.append("⏰ 强闹钟建议 \(triggeredAlarms.count) 项")
         }
-        if parts.isEmpty && errors.isEmpty { return "未选中任何要写入的项目" }
+        if parts.isEmpty && errors.isEmpty { return "没有待写入的新项目（已写入项目不会重复提交）" }
         let base = parts.joined(separator: " · ")
         if errors.isEmpty {
             return "已写入：\(base)"
@@ -60,6 +60,11 @@ public final class LocalAlarmScheduler {
         RunLoop.main.add(timer, forMode: .common)
         scheduledTimers[id] = timer
     }
+
+    public func cancelAlarm(id: UUID) {
+        scheduledTimers[id]?.invalidate()
+        scheduledTimers.removeValue(forKey: id)
+    }
 }
 
 public final class AppleExecutors: @unchecked Sendable {
@@ -89,10 +94,8 @@ public final class AppleExecutors: @unchecked Sendable {
 
     @MainActor
     public static func openInTargetApp(for item: DraftItem) {
-        // 1. Immediately bring the target system app to front
         openSystemApp(for: item.targetKind)
 
-        // 2. Deep-link / navigate to the exact date, reminder, or note via JXA
         let kind = item.targetKind
         let extID = item.createdExternalID ?? ""
         let title = item.title
@@ -165,15 +168,158 @@ public final class AppleExecutors: @unchecked Sendable {
         process.waitUntilExit()
     }
 
-    // MARK: - Execution
+    // MARK: - Calendar Time Conflict Detection
+
+    public func detectCalendarConflicts(for items: [DraftItem]) -> [UUID: String] {
+        guard EKEventStore.authorizationStatus(for: .event) == .fullAccess else {
+            return [:]
+        }
+        return lock.withLock {
+            var conflicts: [UUID: String] = [:]
+            for item in items where !item.isCommitted && item.targetKind == .calendar {
+                guard let start = PromptBuilder.parseISODate(item.startISO) else { continue }
+                let end: Date
+                if let parsedEnd = PromptBuilder.parseISODate(item.endISO), parsedEnd > start {
+                    end = parsedEnd
+                } else {
+                    end = start.addingTimeInterval(3600)
+                }
+                let pred = eventStore.predicateForEvents(withStart: start, end: end, calendars: nil)
+                let overlapping = eventStore.events(matching: pred).filter { ev in
+                    !ev.isAllDay && ev.title != item.title && ev.endDate > start && ev.startDate < end
+                }
+                if let firstConflict = overlapping.first, let conflictTitle = firstConflict.title, !conflictTitle.isEmpty {
+                    conflicts[item.id] = conflictTitle
+                }
+            }
+            return conflicts
+        }
+    }
+
+    // MARK: - 1-Click Delete Committed Item from System (Calendar / Reminders / Alarm / Notes)
+
+    public func deleteFromSystem(item: DraftItem) async -> String {
+        let extID = item.createdExternalID ?? ""
+        let title = item.title
+
+        switch item.targetKind {
+        case .calendar:
+            var removedCount = 0
+            lock.withLock {
+                if !extID.isEmpty {
+                    for calItem in eventStore.calendarItems(withExternalIdentifier: extID) {
+                        if let ev = calItem as? EKEvent {
+                            try? eventStore.remove(ev, span: .thisEvent, commit: true)
+                            removedCount += 1
+                        }
+                    }
+                }
+                if removedCount == 0, let startDate = PromptBuilder.parseISODate(item.startISO) {
+                    let pred = eventStore.predicateForEvents(
+                        withStart: startDate.addingTimeInterval(-3600),
+                        end: startDate.addingTimeInterval(86400),
+                        calendars: nil
+                    )
+                    for ev in eventStore.events(matching: pred) where ev.title == title {
+                        try? eventStore.remove(ev, span: .thisEvent, commit: true)
+                        removedCount += 1
+                    }
+                }
+            }
+            return "🗑️ 已从系统「日历」中删除「\(title)」"
+
+        case .reminder, .alarm:
+            await MainActor.run {
+                LocalAlarmScheduler.shared.cancelAlarm(id: item.id)
+            }
+            let alarmTitle = (item.targetKind == .alarm && !title.hasPrefix("⏰")) ? "⏰ 【闹钟】\(title)" : title
+
+            lock.withLock {
+                if !extID.isEmpty {
+                    for calItem in eventStore.calendarItems(withExternalIdentifier: extID) {
+                        if let rem = calItem as? EKReminder {
+                            try? eventStore.remove(rem, commit: true)
+                        } else if let ev = calItem as? EKEvent {
+                            try? eventStore.remove(ev, span: .thisEvent, commit: true)
+                        }
+                    }
+                }
+                if item.targetKind == .alarm,
+                   let alarmDate = PromptBuilder.parseISODate(item.startISO.isEmpty ? item.alarmTimeISO : item.startISO) {
+                    let pred = eventStore.predicateForEvents(
+                        withStart: alarmDate.addingTimeInterval(-1800),
+                        end: alarmDate.addingTimeInterval(3600),
+                        calendars: nil
+                    )
+                    for ev in eventStore.events(matching: pred) where ev.title == alarmTitle || ev.title == title {
+                        try? eventStore.remove(ev, span: .thisEvent, commit: true)
+                    }
+                }
+            }
+
+            await Task.detached(priority: .userInitiated) {
+                let jxa = """
+                ObjC.import('Foundation');
+                const args = $.NSProcessInfo.processInfo.arguments;
+                const targetID = ObjC.unwrap(args.objectAtIndex(4));
+                const targetTitle = ObjC.unwrap(args.objectAtIndex(5));
+                const rawTitle = ObjC.unwrap(args.objectAtIndex(6));
+                const Rem = Application("Reminders");
+                try {
+                    if (targetID.length > 0) {
+                        Rem.delete(Rem.reminders.byId(targetID));
+                    }
+                } catch (e) {}
+                try {
+                    const list1 = Rem.reminders.whose({name: targetTitle})();
+                    for (let i = 0; i < list1.length; i++) { Rem.delete(list1[i]); }
+                    if (rawTitle !== targetTitle) {
+                        const list2 = Rem.reminders.whose({name: rawTitle})();
+                        for (let i = 0; i < list2.length; i++) { Rem.delete(list2[i]); }
+                    }
+                } catch (e) {}
+                """
+                Self.runQuickJXA(jxa, arguments: [extID, alarmTitle, title])
+            }.value
+
+            return "🗑️ 已从系统「\(item.targetKind == .alarm ? "闹钟与提醒事项" : "提醒事项")」中删除「\(title)」"
+
+        case .note:
+            await Task.detached(priority: .userInitiated) {
+                let jxa = """
+                ObjC.import('Foundation');
+                const args = $.NSProcessInfo.processInfo.arguments;
+                const targetID = ObjC.unwrap(args.objectAtIndex(4));
+                const targetTitle = ObjC.unwrap(args.objectAtIndex(5));
+                const Notes = Application("Notes");
+                try {
+                    if (targetID.length > 0) {
+                        Notes.delete(Notes.notes.byId(targetID));
+                        return;
+                    }
+                } catch (e) {}
+                try {
+                    const found = Notes.notes.whose({name: targetTitle})();
+                    if (found.length > 0) { Notes.delete(found[0]); }
+                } catch (e) {}
+                """
+                Self.runQuickJXA(jxa, arguments: [extID, title])
+            }.value
+            return "🗑️ 已从系统「备忘录」中删除「\(title)」"
+        }
+    }
+
+    // MARK: - Execution (Strictly Pending Items Only + Idempotent Deduplication)
 
     public func execute(plan: ParsedPlan) async -> ExecutionReport {
         var report = ExecutionReport()
 
-        let selectedEvents = plan.events.filter(\.isSelected)
-        let selectedReminders = plan.reminders.filter(\.isSelected)
-        let selectedAlarms = plan.alarms.filter(\.isSelected)
-        let selectedNotes = plan.notes.filter(\.isSelected)
+        // Strictly filter to uncommitted (!isCommitted) & selected items to prevent duplicate writes!
+        let pendingSelected = plan.pendingItems.filter(\.isSelected)
+        let selectedEvents = pendingSelected.filter { $0.targetKind == .calendar }.map { $0.asCalendarEventDraft() }
+        let selectedReminders = pendingSelected.filter { $0.targetKind == .reminder }.map { $0.asReminderDraft() }
+        let selectedAlarms = pendingSelected.filter { $0.targetKind == .alarm }
+        let selectedNotes = pendingSelected.filter { $0.targetKind == .note }.map { $0.asKeyNoteDraft() }
 
         if !selectedEvents.isEmpty || !selectedAlarms.isEmpty {
             do {
@@ -288,19 +434,29 @@ public final class AppleExecutors: @unchecked Sendable {
             }
 
             if let evCal = eventStore.defaultCalendarForNewEvents ?? eventStore.calendars(for: .event).first(where: { $0.allowsContentModifications }) {
-                let ev = EKEvent(eventStore: eventStore)
-                ev.calendar = evCal
-                ev.title = alarmTitle
-                ev.startDate = alarmDate
-                ev.endDate = alarmDate.addingTimeInterval(900)
-                ev.location = draft.location
-                ev.notes = draft.notes
-                ev.addAlarm(EKAlarm(relativeOffset: 0))
-                ev.addAlarm(EKAlarm(relativeOffset: -300))
-                for offset in PromptBuilder.alarmRelativeOffsets(forLeadTimeMinutes: draft.leadTimeMinutes) where offset < 0 {
-                    ev.addAlarm(EKAlarm(relativeOffset: offset))
+                let pred = eventStore.predicateForEvents(
+                    withStart: alarmDate.addingTimeInterval(-60),
+                    end: alarmDate.addingTimeInterval(960),
+                    calendars: nil
+                )
+                let alreadyExists = eventStore.events(matching: pred).contains {
+                    $0.title == alarmTitle && abs($0.startDate.timeIntervalSince(alarmDate)) < 60
                 }
-                try? eventStore.save(ev, span: .thisEvent, commit: true)
+                if !alreadyExists {
+                    let ev = EKEvent(eventStore: eventStore)
+                    ev.calendar = evCal
+                    ev.title = alarmTitle
+                    ev.startDate = alarmDate
+                    ev.endDate = alarmDate.addingTimeInterval(900)
+                    ev.location = draft.location
+                    ev.notes = draft.notes
+                    ev.addAlarm(EKAlarm(relativeOffset: 0))
+                    ev.addAlarm(EKAlarm(relativeOffset: -300))
+                    for offset in PromptBuilder.alarmRelativeOffsets(forLeadTimeMinutes: draft.leadTimeMinutes) where offset < 0 {
+                        ev.addAlarm(EKAlarm(relativeOffset: offset))
+                    }
+                    try? eventStore.save(ev, span: .thisEvent, commit: true)
+                }
             }
         }
 
@@ -324,12 +480,25 @@ public final class AppleExecutors: @unchecked Sendable {
                 throw NSError(domain: "MemoPilot.EventKit", code: 3, userInfo: [NSLocalizedDescriptionKey: "无法解析日程开始时间（\(draft.startISO)）"])
             }
             let endDate = PromptBuilder.parseISODate(draft.endISO) ?? startDate.addingTimeInterval(3600)
+            let finalEndDate = endDate > startDate ? endDate : startDate.addingTimeInterval(1800)
+
+            // EventKit Deduplication Guard: if an event with identical title & start time already exists, do not duplicate!
+            let dupPred = eventStore.predicateForEvents(
+                withStart: startDate.addingTimeInterval(-60),
+                end: finalEndDate.addingTimeInterval(60),
+                calendars: nil
+            )
+            if let existing = eventStore.events(matching: dupPred).first(where: {
+                $0.title == draft.title && abs($0.startDate.timeIntervalSince(startDate)) < 60
+            }) {
+                return existing.calendarItemExternalIdentifier
+            }
 
             let event = EKEvent(eventStore: eventStore)
             event.calendar = calendar
             event.title = draft.title
             event.startDate = startDate
-            event.endDate = endDate > startDate ? endDate : startDate.addingTimeInterval(1800)
+            event.endDate = finalEndDate
             if !draft.location.isEmpty {
                 event.location = draft.location
             }
@@ -402,6 +571,7 @@ public final class AppleExecutors: @unchecked Sendable {
 
             let fullHTML = "<h1>\(safeTitle)</h1><p><em>分类：\(safeCategory)</em></p><hr><p>\(htmlBody)</p>"
 
+            // Deduplicating AppleScript: if a note with the exact same title already exists, update it instead of creating a duplicate
             let script = """
             on run argv
                 set noteTitle to item 1 of argv
@@ -409,6 +579,12 @@ public final class AppleExecutors: @unchecked Sendable {
                 tell application "Notes"
                     tell default account
                         try
+                            set existingNotes to (every note of default folder whose name is noteTitle)
+                            if (count of existingNotes) > 0 then
+                                set existingNote to item 1 of existingNotes
+                                set body of existingNote to noteBody
+                                return id of existingNote
+                            end if
                             set createdNote to make new note at default folder with properties {name:noteTitle, body:noteBody}
                             return id of createdNote
                         on error
