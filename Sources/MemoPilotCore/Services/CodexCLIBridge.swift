@@ -364,30 +364,14 @@ public enum CodexCLIBridge {
             let prompt = PromptBuilder.buildPrompt(userText: combinedText, hasImage: imagePath != nil)
                 + "\n\n注意：请直接生成最终 JSON，绝不要调用任何 shell 命令或外部工具。"
 
-            // Strip all heavy desktop MCP servers (e.g. node_repl 120s timeout), plugins, shell snapshots,
-            // and use minimal/low reasoning effort + system proxy support for fast response latency.
-            var args: [String] = [
-                "exec",
-                "--ignore-user-config",
-                "--ephemeral",
-                "-C", tempDir.path,
-                "-c", "model_reasoning_effort=\"\(speedProfile.codexReasoningEffort)\"",
-                "--enable", "respect_system_proxy",
-                "--disable", "shell_tool",
-                "--disable", "shell_snapshot",
-                "--disable", "plugins",
-                "--disable", "apps",
-                "--disable", "browser_use",
-                "--disable", "computer_use",
-                "--skip-git-repo-check",
-                "--sandbox", "read-only",
-                "--output-schema", schemaURL.path,
-                "-o", outputURL.path
-            ]
-            if let imagePath, !imagePath.isEmpty {
-                args.append(contentsOf: ["-i", imagePath])
-            }
-            args.append(prompt)
+            let args = Self.buildCodexExecArguments(
+                tempDirPath: tempDir.path,
+                schemaPath: schemaURL.path,
+                outputPath: outputURL.path,
+                imagePath: imagePath,
+                prompt: prompt,
+                speedProfile: speedProfile
+            )
 
             let processOut = try runProcess(
                 codexPath,
@@ -406,6 +390,41 @@ public enum CodexCLIBridge {
             let rawJSON = try String(contentsOf: outputURL, encoding: .utf8)
             return try ParsedPlan.decode(from: rawJSON)
         }.value
+    }
+
+    public static func buildCodexExecArguments(
+        tempDirPath: String,
+        schemaPath: String,
+        outputPath: String,
+        imagePath: String?,
+        prompt: String,
+        speedProfile: AISpeedProfile = .flash
+    ) -> [String] {
+        var args: [String] = [
+            "exec",
+            "--ignore-user-config",
+            "--ephemeral",
+            "-C", tempDirPath,
+            "-c", "model_reasoning_effort=\"\(speedProfile.codexReasoningEffort)\"",
+            "--enable", "respect_system_proxy",
+            "--disable", "shell_tool",
+            "--disable", "shell_snapshot",
+            "--disable", "plugins",
+            "--disable", "apps",
+            "--disable", "browser_use",
+            "--disable", "computer_use",
+            "--skip-git-repo-check",
+            "--sandbox", "read-only",
+            "--output-schema", schemaPath,
+            "-o", outputPath
+        ]
+        if let imagePath, !imagePath.isEmpty {
+            args.append(contentsOf: ["-i", imagePath])
+        }
+        // `--` terminates variadic `-i <FILE>...` option parsing so `prompt` is never swallowed as a second image file!
+        args.append("--")
+        args.append(prompt)
+        return args
     }
 
     @discardableResult
