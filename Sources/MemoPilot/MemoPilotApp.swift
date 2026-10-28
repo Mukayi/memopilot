@@ -67,6 +67,8 @@ final class AppViewModel: ObservableObject {
     )
     @Published var parsedPlan: ParsedPlan?
     @Published var editingItemID: UUID?
+    @Published var isShowingShortcutSettings: Bool = false
+    @Published var hotKeyConfig: HotKeyConfiguration = HotKeyConfiguration.load()
     @Published var statusBanner: String?
     @Published var isErrorBanner: Bool = false
 
@@ -185,7 +187,7 @@ final class AppViewModel: ObservableObject {
                 await self?.analyzeClipboard()
             }
         }
-        GlobalHotKeyService.shared.registerDefaultHotKeys()
+        GlobalHotKeyService.shared.applyConfiguration(hotKeyConfig)
 
         // Clean up any stale command left from a previous session
         if FileManager.default.fileExists(atPath: CursorRemoteControl.commandFilePath),
@@ -241,6 +243,18 @@ final class AppViewModel: ObservableObject {
                 self.codexStatus = status
             }
         }
+    }
+
+    func updateHotKeyConfig(_ newConfig: HotKeyConfiguration) {
+        hotKeyConfig = newConfig
+        newConfig.save()
+        GlobalHotKeyService.shared.applyConfiguration(newConfig)
+    }
+
+    func resetHotKeysToDefault() {
+        updateHotKeyConfig(.default)
+        statusBanner = "⌨️ 已恢复默认全局快捷键（⌥Space / ⌥C / ⌥⇧S）"
+        isErrorBanner = false
     }
 
     private func reconcileSelectionWithFilter() {
@@ -424,6 +438,25 @@ final class AppViewModel: ObservableObject {
         case "sync-notes":
             await syncAppleNotesFolder(manualTrigger: true)
             CursorRemoteControl.writeResponse("✅ 已执行苹果备忘录同步：\(statusBanner ?? "")")
+
+        case "open-shortcuts":
+            isShowingShortcutSettings = true
+            CursorRemoteControl.writeResponse("✅ 已打开快捷键自定义面板")
+
+        case "close-shortcuts":
+            isShowingShortcutSettings = false
+            CursorRemoteControl.writeResponse("✅ 已关闭快捷键自定义面板")
+
+        case "demo-partial-commit":
+            if var plan = parsedPlan, plan.items.count >= 4 {
+                let idsToMark: Set<UUID> = [plan.items[0].id, plan.items[3].id]
+                plan.markItemsCommitted(idsToMark)
+                parsedPlan = plan
+                syncCurrentPlanIntoSelectedRecord(plan, immediateSave: true)
+                CursorRemoteControl.writeResponse("✅ 已将 2 条草稿标记为已写入系统")
+            } else {
+                CursorRemoteControl.writeResponse("⚠️ 草稿项不足")
+            }
 
         case "screenshot":
             let outPath = cmd.text ?? "/Users/xiatianze/Desktop/MemoPilot/docs/live-cursor-operated.png"
@@ -851,7 +884,7 @@ final class AppViewModel: ObservableObject {
     }
 
     func commitCurrentPlan() async {
-        guard !isExecuting, let planToCommit = parsedPlan, selectedTotalCount > 0 else { return }
+        guard !isExecuting, var planToCommit = parsedPlan, selectedTotalCount > 0 else { return }
         let targetRecordID = selectedRecordID
         isExecuting = true
         let report = await AppleExecutors.shared.execute(plan: planToCommit)
@@ -860,11 +893,19 @@ final class AppViewModel: ObservableObject {
             isErrorBanner = !report.errors.isEmpty
             statusBanner = report.summaryText
 
+            if !report.committedItemIDs.isEmpty {
+                planToCommit.markItemsCommitted(report.committedItemIDs)
+            }
+            if selectedRecordID == targetRecordID {
+                parsedPlan = planToCommit
+            }
+
             if let id = targetRecordID,
                let idx = historyRecords.firstIndex(where: { $0.id == id }) {
                 historyRecords[idx].plan = planToCommit
-                if report.errors.isEmpty {
-                    historyRecords[idx].isCommitted = true
+                let allCommitted = !planToCommit.items.isEmpty && planToCommit.pendingItems.isEmpty
+                if allCommitted || (report.errors.isEmpty && !report.committedItemIDs.isEmpty) {
+                    historyRecords[idx].isCommitted = allCommitted
                     historyRecords[idx].committedAt = Date()
                 }
                 historyRecords[idx].commitSummary = report.summaryText

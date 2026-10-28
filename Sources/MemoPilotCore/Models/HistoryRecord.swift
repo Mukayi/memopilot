@@ -30,7 +30,14 @@ public struct HistoryRecord: Codable, Sendable, Equatable, Identifiable {
         self.createdAt = createdAt
         self.rawInputText = rawInputText
         self.savedImagePath = savedImagePath
-        self.plan = plan
+        var normalizedPlan = plan
+        if isCommitted && !normalizedPlan.items.contains(where: \.isCommitted) {
+            for idx in normalizedPlan.items.indices {
+                normalizedPlan.items[idx].isCommitted = true
+                normalizedPlan.items[idx].isSelected = false
+            }
+        }
+        self.plan = normalizedPlan
         self.isCommitted = isCommitted
         self.isPinned = isPinned
         self.commitSummary = commitSummary
@@ -43,8 +50,16 @@ public struct HistoryRecord: Codable, Sendable, Equatable, Identifiable {
         self.createdAt = (try? c.decodeIfPresent(Date.self, forKey: .createdAt)) ?? Date()
         self.rawInputText = (try? c.decodeIfPresent(String.self, forKey: .rawInputText)) ?? ""
         self.savedImagePath = try? c.decodeIfPresent(String.self, forKey: .savedImagePath)
-        self.plan = (try? c.decodeIfPresent(ParsedPlan.self, forKey: .plan)) ?? ParsedPlan()
-        self.isCommitted = (try? c.decodeIfPresent(Bool.self, forKey: .isCommitted)) ?? false
+        var decodedPlan = (try? c.decodeIfPresent(ParsedPlan.self, forKey: .plan)) ?? ParsedPlan()
+        let decodedCommitted = (try? c.decodeIfPresent(Bool.self, forKey: .isCommitted)) ?? false
+        if decodedCommitted && !decodedPlan.items.contains(where: \.isCommitted) {
+            for idx in decodedPlan.items.indices {
+                decodedPlan.items[idx].isCommitted = true
+                decodedPlan.items[idx].isSelected = false
+            }
+        }
+        self.plan = decodedPlan
+        self.isCommitted = decodedCommitted
         self.isPinned = (try? c.decodeIfPresent(Bool.self, forKey: .isPinned)) ?? false
         self.commitSummary = try? c.decodeIfPresent(String.self, forKey: .commitSummary)
         self.committedAt = try? c.decodeIfPresent(Date.self, forKey: .committedAt)

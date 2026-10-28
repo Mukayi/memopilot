@@ -486,7 +486,15 @@ struct MainWorkspaceView: View {
         if !plan.reminders.isEmpty { parts.append("提醒 \(plan.reminders.count)") }
         if !plan.alarms.isEmpty { parts.append("闹钟 \(plan.alarms.count)") }
         if !plan.notes.isEmpty { parts.append("备忘 \(plan.notes.count)") }
-        parts.append(isCommitted ? "已写入" : "待确认")
+        let committedCount = plan.committedItems.count
+        let pendingCount = plan.pendingItems.count
+        if committedCount > 0 && pendingCount > 0 {
+            parts.append("待写入 \(pendingCount) · 已写入 \(committedCount)")
+        } else if isCommitted || (committedCount > 0 && pendingCount == 0) {
+            parts.append("全部已写入")
+        } else {
+            parts.append("待写入")
+        }
         return parts.joined(separator: " · ")
     }
 
@@ -585,6 +593,32 @@ struct MainWorkspaceView: View {
                             .strokeBorder(palette.hairline, lineWidth: 1)
                     )
             )
+
+            // Shortcut Customization Popover Button
+            Button {
+                viewModel.isShowingShortcutSettings.toggle()
+            } label: {
+                HStack(alignment: .center, spacing: 4) {
+                    Image(systemName: "keyboard")
+                        .font(.system(size: 11, weight: .medium))
+                    Text("快捷键")
+                        .font(.system(size: 11, weight: .medium))
+                }
+                .foregroundStyle(.secondary)
+                .padding(.horizontal, 8)
+                .frame(height: 24)
+                .background(
+                    Capsule()
+                        .fill(palette.composerWellBg)
+                        .overlay(Capsule().strokeBorder(palette.hairline, lineWidth: 1))
+                )
+            }
+            .buttonStyle(.plain)
+            .fixedSize()
+            .help("自定义全局快捷键（呼出窗口 / 剪贴板拆解 / 截图识别）")
+            .popover(isPresented: $viewModel.isShowingShortcutSettings, arrowEdge: .bottom) {
+                ShortcutSettingsPopoverView(viewModel: viewModel)
+            }
 
             // Unified Theme & Options Menu
             Menu {
@@ -753,10 +787,11 @@ struct MainWorkspaceView: View {
             Button {
                 Task { await viewModel.analyzeClipboard() }
             } label: {
+                let badge = viewModel.hotKeyConfig.clipboardAnalyze.shortBadge
                 HStack(alignment: .center, spacing: 4) {
                     Image(systemName: "doc.on.clipboard")
                         .font(.system(size: 10.5, weight: .medium))
-                    Text("剪贴板 ⌥C")
+                    Text(badge.isEmpty ? "剪贴板" : "剪贴板 \(badge)")
                         .font(.system(size: 11, weight: .medium))
                 }
                 .foregroundStyle(.secondary)
@@ -770,7 +805,7 @@ struct MainWorkspaceView: View {
             .buttonStyle(.plain)
             .fixedSize()
             .disabled(viewModel.isAnalyzing)
-            .help("一键读取当前剪贴板中的文字或图片并智能拆解 (全局快捷键 ⌥C)")
+            .help("一键读取当前剪贴板中的文字或图片并智能拆解")
 
             Button {
                 Task { await viewModel.syncAppleNotesFolder(manualTrigger: true) }
@@ -797,10 +832,11 @@ struct MainWorkspaceView: View {
             Button {
                 Task { await viewModel.captureScreenAndAnalyze() }
             } label: {
+                let badge = viewModel.hotKeyConfig.quickScreenshot.shortBadge
                 HStack(alignment: .center, spacing: 4) {
                     Image(systemName: "viewfinder")
                         .font(.system(size: 11, weight: .medium))
-                    Text("截图识别 ⌥⇧S")
+                    Text(badge.isEmpty ? "截图识别" : "截图识别 \(badge)")
                         .font(.system(size: 11, weight: .medium))
                 }
                 .foregroundStyle(.secondary)
@@ -968,10 +1004,20 @@ struct MainWorkspaceView: View {
                     Button {
                         Task { await viewModel.commitCurrentPlan() }
                     } label: {
+                        let allDone = activePlan.pendingItems.isEmpty && !activePlan.items.isEmpty
+                        let btnLabel: String = {
+                            if allDone && viewModel.selectedTotalCount == 0 {
+                                return "全部已写入"
+                            } else if allDone {
+                                return "重新写入 (\(viewModel.selectedTotalCount))"
+                            } else {
+                                return "一键写入系统 (\(viewModel.selectedTotalCount))"
+                            }
+                        }()
                         HStack(alignment: .center, spacing: 4) {
                             Image(systemName: "checkmark")
                                 .font(.system(size: 10, weight: .bold))
-                            Text(record.isCommitted ? "重新写入 (\(viewModel.selectedTotalCount))" : "一键写入系统 (\(viewModel.selectedTotalCount))")
+                            Text(btnLabel)
                                 .font(.system(size: 11.5, weight: .semibold))
                         }
                         .foregroundStyle(palette.primaryActionFg)
@@ -1000,17 +1046,73 @@ struct MainWorkspaceView: View {
     }
 
     private func sheetRowsBody(plan: ParsedPlan) -> some View {
-        VStack(alignment: .leading, spacing: 0) {
-            ForEach(plan.items) { item in
-                editableDraftRow(item: item)
-                if item.id != plan.items.last?.id {
+        let pending = plan.pendingItems
+        let committed = plan.committedItems
+        let hasBoth = !pending.isEmpty && !committed.isEmpty
+
+        return VStack(alignment: .leading, spacing: 0) {
+            // 1. Pending Drafts Section
+            if !pending.isEmpty {
+                if hasBoth {
+                    sectionStatusHeader(
+                        title: "待写入草稿 (\(pending.count))",
+                        dotColor: palette.reminderTone
+                    )
+                }
+                ForEach(pending) { item in
+                    editableDraftRow(item: item)
+                    if item.id != pending.last?.id {
+                        Rectangle()
+                            .fill(palette.hairline)
+                            .frame(height: 1)
+                            .padding(.leading, col3LeadingIndent)
+                    }
+                }
+            }
+
+            // 2. Committed Items Section (Visually separated so already-written items are clear & never double-committed)
+            if !committed.isEmpty {
+                if hasBoth {
                     Rectangle()
                         .fill(palette.hairline)
                         .frame(height: 1)
-                        .padding(.leading, col3LeadingIndent)
+                        .padding(.vertical, 8)
+                }
+                sectionStatusHeader(
+                    title: "已写入系统 (\(committed.count))",
+                    dotColor: palette.committedTone,
+                    hint: "如需再次写入可重新勾选"
+                )
+                ForEach(committed) { item in
+                    editableDraftRow(item: item)
+                    if item.id != committed.last?.id {
+                        Rectangle()
+                            .fill(palette.hairline)
+                            .frame(height: 1)
+                            .padding(.leading, col3LeadingIndent)
+                    }
                 }
             }
         }
+    }
+
+    private func sectionStatusHeader(title: String, dotColor: Color, hint: String? = nil) -> some View {
+        HStack(alignment: .center, spacing: 6) {
+            Circle()
+                .fill(dotColor)
+                .frame(width: 5.5, height: 5.5)
+            Text(title)
+                .font(.system(size: 11, weight: .semibold))
+                .foregroundStyle(.secondary)
+            if let hint {
+                Text("· \(hint)")
+                    .font(.system(size: 10.5))
+                    .foregroundStyle(.tertiary)
+            }
+            Spacer()
+        }
+        .padding(.top, 10)
+        .padding(.bottom, 2)
     }
 
     private func tone(for kind: DraftTargetKind) -> Color {
@@ -1079,10 +1181,27 @@ struct MainWorkspaceView: View {
                     } label: {
                         Text(current.title.isEmpty ? "未命名事项" : current.title)
                             .font(.system(size: 13, weight: .semibold))
-                            .foregroundStyle(.primary)
+                            .foregroundStyle(current.isCommitted && !current.isSelected ? .secondary : .primary)
                             .lineLimit(1)
                     }
                     .buttonStyle(.plain)
+
+                    if current.isCommitted {
+                        HStack(alignment: .center, spacing: 3) {
+                            Image(systemName: "checkmark.seal.fill")
+                                .font(.system(size: 9))
+                            Text("已写入")
+                                .font(.system(size: 9.5, weight: .medium))
+                        }
+                        .foregroundStyle(palette.committedTone)
+                        .padding(.horizontal, 5.5)
+                        .frame(height: 17)
+                        .background(
+                            RoundedRectangle(cornerRadius: 4, style: .continuous)
+                                .fill(palette.committedTone.opacity(0.11))
+                        )
+                        .fixedSize()
+                    }
 
                     Spacer(minLength: 8)
 
@@ -1129,7 +1248,7 @@ struct MainWorkspaceView: View {
             }
         }
         .padding(.vertical, 10.5)
-        .opacity(current.isSelected ? 1.0 : 0.45)
+        .opacity(current.isSelected ? 1.0 : (current.isCommitted ? 0.72 : 0.45))
         .popover(isPresented: isPopoverOpen, arrowEdge: .trailing) {
             draftEditorPopover(item: current)
         }

@@ -7,6 +7,7 @@ public struct ExecutionReport: Sendable {
     public var createdRemindersCount: Int = 0
     public var createdAlarmsCount: Int = 0
     public var createdNotesCount: Int = 0
+    public var committedItemIDs: Set<UUID> = []
     public var triggeredAlarms: [String] = []
     public var errors: [String] = []
 
@@ -86,6 +87,7 @@ public final class AppleExecutors: @unchecked Sendable {
                         do {
                             try createCalendarEvent(from: draft)
                             report.createdEventsCount += 1
+                            report.committedItemIDs.insert(draft.id)
                             if draft.needsAlarm {
                                 report.triggeredAlarms.append("\(draft.title) (\(draft.alarmTimeISO.isEmpty ? draft.startISO : draft.alarmTimeISO))")
                             }
@@ -114,6 +116,7 @@ public final class AppleExecutors: @unchecked Sendable {
                         do {
                             try createReminder(from: draft)
                             report.createdRemindersCount += 1
+                            report.committedItemIDs.insert(draft.id)
                         } catch {
                             report.errors.append("提醒「\(draft.title)」写入失败: \(error.localizedDescription)")
                         }
@@ -122,6 +125,7 @@ public final class AppleExecutors: @unchecked Sendable {
                         do {
                             try await createAlarmEntry(from: alarmDraft)
                             report.createdAlarmsCount += 1
+                            report.committedItemIDs.insert(alarmDraft.id)
                             report.triggeredAlarms.append("\(alarmDraft.title)")
                         } catch {
                             report.errors.append("闹钟「\(alarmDraft.title)」设置失败: \(error.localizedDescription)")
@@ -139,6 +143,7 @@ public final class AppleExecutors: @unchecked Sendable {
             do {
                 try await createAppleNoteAsync(from: note)
                 report.createdNotesCount += 1
+                report.committedItemIDs.insert(note.id)
             } catch {
                 report.errors.append("备忘录「\(note.title)」写入失败: \(error.localizedDescription)")
             }

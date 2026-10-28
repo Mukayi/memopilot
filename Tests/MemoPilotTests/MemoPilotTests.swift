@@ -249,4 +249,24 @@ struct MemoPilotTests {
         #expect(path.contains(".local/node/bin"))
         _ = CodexCLIBridge.systemProxyEnvironment()
     }
+
+    @Test("Mark individual draft items as committed, separate pending vs committed, and format custom HotKeyBinding")
+    func itemLevelCommittedSeparationAndHotKeyFormat() {
+        let item1 = DraftItem(targetKind: .calendar, title: "会议1")
+        let item2 = DraftItem(targetKind: .reminder, title: "待办2")
+        var plan = ParsedPlan(summary: "测试单条写入状态", items: [item1, item2])
+        #expect(plan.pendingItems.count == 2)
+        #expect(plan.committedItems.count == 0)
+
+        plan.markItemsCommitted([item1.id])
+        #expect(plan.pendingItems.count == 1)
+        #expect(plan.committedItems.count == 1)
+        #expect(plan.committedItems[0].id == item1.id)
+        #expect(plan.committedItems[0].isSelected == false)
+
+        let hk = HotKeyBinding(keyCode: 8, carbonModifiers: 2048, isEnabled: true)
+        #expect(hk.displayString == "⌥C")
+        let disabledHK = HotKeyBinding(keyCode: 8, carbonModifiers: 2048, isEnabled: false)
+        #expect(disabledHK.displayString == "已关闭")
+    }
 }

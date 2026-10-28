@@ -21,6 +21,7 @@ public enum DraftTargetKind: String, Codable, CaseIterable, Identifiable, Sendab
 public struct DraftItem: Codable, Sendable, Equatable, Identifiable {
     public var id: UUID
     public var isSelected: Bool
+    public var isCommitted: Bool
     public var targetKind: DraftTargetKind
     public var title: String
     public var startISO: String
@@ -34,9 +35,14 @@ public struct DraftItem: Codable, Sendable, Equatable, Identifiable {
     public var reasonForLeadTime: String
     public var category: String
 
+    enum CodingKeys: String, CodingKey {
+        case id, isSelected, isCommitted, targetKind, title, startISO, endISO, location, notes, leadTimeMinutes, priority, needsAlarm, alarmTimeISO, reasonForLeadTime, category
+    }
+
     public init(
         id: UUID = UUID(),
         isSelected: Bool = true,
+        isCommitted: Bool = false,
         targetKind: DraftTargetKind,
         title: String,
         startISO: String = "",
@@ -52,6 +58,7 @@ public struct DraftItem: Codable, Sendable, Equatable, Identifiable {
     ) {
         self.id = id
         self.isSelected = isSelected
+        self.isCommitted = isCommitted
         self.targetKind = targetKind
         self.title = title
         self.startISO = startISO
@@ -64,6 +71,25 @@ public struct DraftItem: Codable, Sendable, Equatable, Identifiable {
         self.alarmTimeISO = alarmTimeISO
         self.reasonForLeadTime = reasonForLeadTime
         self.category = category
+    }
+
+    public init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        self.id = (try? c.decodeIfPresent(UUID.self, forKey: .id)) ?? UUID()
+        self.isSelected = (try? c.decodeIfPresent(Bool.self, forKey: .isSelected)) ?? true
+        self.isCommitted = (try? c.decodeIfPresent(Bool.self, forKey: .isCommitted)) ?? false
+        self.targetKind = (try? c.decodeIfPresent(DraftTargetKind.self, forKey: .targetKind)) ?? .reminder
+        self.title = (try? c.decodeIfPresent(String.self, forKey: .title)) ?? ""
+        self.startISO = (try? c.decodeIfPresent(String.self, forKey: .startISO)) ?? ""
+        self.endISO = (try? c.decodeIfPresent(String.self, forKey: .endISO)) ?? ""
+        self.location = (try? c.decodeIfPresent(String.self, forKey: .location)) ?? ""
+        self.notes = (try? c.decodeIfPresent(String.self, forKey: .notes)) ?? ""
+        self.leadTimeMinutes = (try? c.decodeIfPresent([Int].self, forKey: .leadTimeMinutes)) ?? [15]
+        self.priority = (try? c.decodeIfPresent(Int.self, forKey: .priority)) ?? 0
+        self.needsAlarm = (try? c.decodeIfPresent(Bool.self, forKey: .needsAlarm)) ?? false
+        self.alarmTimeISO = (try? c.decodeIfPresent(String.self, forKey: .alarmTimeISO)) ?? ""
+        self.reasonForLeadTime = (try? c.decodeIfPresent(String.self, forKey: .reasonForLeadTime)) ?? ""
+        self.category = (try? c.decodeIfPresent(String.self, forKey: .category)) ?? "备忘"
     }
 
     public static func fromCalendarEvent(_ e: CalendarEventDraft) -> DraftItem {
@@ -401,6 +427,21 @@ public struct ParsedPlan: Codable, Sendable, Equatable {
     }
 
     // MARK: - Unified Draft Item Operations (UUID-Safe)
+
+    public var pendingItems: [DraftItem] {
+        items.filter { !$0.isCommitted }
+    }
+
+    public var committedItems: [DraftItem] {
+        items.filter(\.isCommitted)
+    }
+
+    public mutating func markItemsCommitted(_ ids: Set<UUID>) {
+        for idx in items.indices where ids.contains(items[idx].id) {
+            items[idx].isCommitted = true
+            items[idx].isSelected = false
+        }
+    }
 
     public func item(id: UUID) -> DraftItem? {
         items.first(where: { $0.id == id })
