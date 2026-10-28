@@ -2,8 +2,6 @@
 
 ![MemoPilot Hero Banner](Assets/MemoPilotHero.gif)
 
-> 一个突发奇想的 vibecoding 产物。MemoPilot 闪记领航，随手记下一句话或截一张微信聊天图，自动帮你拆解成日历日程、提前提醒、强闹钟与结构化备忘。
-
 一款本地优先的 macOS 原生 AI 日程与备忘中枢，使用 Swift 6、SwiftUI、EventKit、Vision 与 Carbon 构建（支持 macOS 15+，通过 iCloud 自动同步至 iPhone）。
 
 ## 亮点预览
