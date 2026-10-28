@@ -46,7 +46,7 @@ struct ShortcutSettingsPopoverView: View {
                 }
                 .font(.system(size: 11, weight: .medium))
                 .foregroundStyle(.secondary)
-                .buttonStyle(.plain)
+                .buttonStyle(FullHitAreaButtonStyle())
             }
 
             Text("点击右侧快捷键胶囊后，直接按下键盘组合键（需含 ⌘ / ⌥ / ⌃ / ⇧）即可修改；按 Delete 可关闭该快捷键。")
@@ -169,7 +169,7 @@ struct ShortcutSettingsPopoverView: View {
                             )
                     )
             }
-            .buttonStyle(.plain)
+            .buttonStyle(FullHitAreaButtonStyle())
 
             Toggle("", isOn: Binding(
                 get: { binding.isEnabled },

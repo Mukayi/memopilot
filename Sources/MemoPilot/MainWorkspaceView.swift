@@ -12,6 +12,16 @@ enum HistoryFilter: String, CaseIterable, Identifiable {
     var id: String { rawValue }
 }
 
+/// Custom ButtonStyle that ensures the entire rectangular bounds of the button label
+/// (including Spacer, secondary lines, and padding) are hit-testable on macOS.
+struct FullHitAreaButtonStyle: ButtonStyle {
+    func makeBody(configuration: Configuration) -> some View {
+        configuration.label
+            .contentShape(Rectangle())
+            .opacity(configuration.isPressed ? 0.80 : 1.0)
+    }
+}
+
 // MARK: - Dynamic Theme Palette (Seamless Paper Canvas + Muted Semantic Tones)
 struct ThemePalette {
     let sidebarBg: Color
@@ -117,6 +127,7 @@ struct MainWorkspaceView: View {
     @FocusState private var isComposerFocused: Bool
     @FocusState private var isSearchFocused: Bool
     @State private var dragStartSidebarWidth: CGFloat?
+    @State private var hoveredRecordID: UUID?
 
     // Strict 3-Column Alignment Constant:
     // Col 1 (18pt checkbox) + 10pt gap + Col 2 (44pt target pill) + 12pt gap = 84pt
@@ -205,23 +216,22 @@ struct MainWorkspaceView: View {
             HStack(spacing: 2) {
                 ForEach(HistoryFilter.allCases) { filter in
                     let isSelected = viewModel.selectedFilter == filter
-                    Button {
-                        withAnimation(.easeInOut(duration: 0.15)) {
-                            viewModel.selectedFilter = filter
+                    Text(filter.rawValue)
+                        .font(.system(size: 11, weight: isSelected ? .semibold : .regular))
+                        .foregroundStyle(isSelected ? .primary : .secondary)
+                        .frame(maxWidth: .infinity)
+                        .frame(height: 24)
+                        .background(
+                            RoundedRectangle(cornerRadius: 5.5, style: .continuous)
+                                .fill(isSelected ? palette.sidebarSelectedRow : Color.primary.opacity(0.001))
+                                .shadow(color: isSelected ? Color.black.opacity(0.04) : .clear, radius: 2, x: 0, y: 1)
+                        )
+                        .contentShape(Rectangle())
+                        .onTapGesture {
+                            withAnimation(.easeInOut(duration: 0.15)) {
+                                viewModel.selectedFilter = filter
+                            }
                         }
-                    } label: {
-                        Text(filter.rawValue)
-                            .font(.system(size: 11, weight: isSelected ? .semibold : .regular))
-                            .foregroundStyle(isSelected ? .primary : .secondary)
-                            .frame(maxWidth: .infinity)
-                            .frame(height: 24)
-                            .background(
-                                RoundedRectangle(cornerRadius: 5.5, style: .continuous)
-                                    .fill(isSelected ? palette.sidebarSelectedRow : Color.clear)
-                                    .shadow(color: isSelected ? Color.black.opacity(0.04) : .clear, radius: 2, x: 0, y: 1)
-                            )
-                    }
-                    .buttonStyle(.plain)
                 }
             }
             .padding(3)
@@ -261,7 +271,7 @@ struct MainWorkspaceView: View {
                     }
                     .font(.system(size: 10.5))
                     .foregroundStyle(.secondary)
-                    .buttonStyle(.plain)
+                    .buttonStyle(FullHitAreaButtonStyle())
                 }
             }
             .padding(.horizontal, 12)
@@ -284,7 +294,7 @@ struct MainWorkspaceView: View {
                         .fill(palette.subtleButtonBg)
                 )
         }
-        .buttonStyle(.plain)
+        .buttonStyle(FullHitAreaButtonStyle())
         .help(viewModel.isSidebarCollapsed ? "展开历史侧边栏 (⌃⌘S)" : "隐藏历史侧边栏 (⌃⌘S)")
     }
 
@@ -305,7 +315,7 @@ struct MainWorkspaceView: View {
                         .fill(palette.subtleButtonBg)
                 )
         }
-        .buttonStyle(.plain)
+        .buttonStyle(FullHitAreaButtonStyle())
         .keyboardShortcut("n", modifiers: [.command])
         .help("新建备忘输入 (⌘N)")
     }
@@ -351,33 +361,34 @@ struct MainWorkspaceView: View {
         records: [HistoryRecord]
     ) -> some View {
         VStack(alignment: .leading, spacing: 4) {
-            Button {
+            HStack(alignment: .center, spacing: 5) {
+                Image(systemName: isExpanded.wrappedValue ? "chevron.down" : "chevron.right")
+                    .font(.system(size: 8.5, weight: .bold))
+                    .foregroundStyle(.tertiary)
+                    .frame(width: 10)
+                if let icon {
+                    Image(systemName: icon)
+                        .font(.system(size: 9))
+                        .foregroundStyle(.secondary)
+                }
+                Text(title)
+                    .font(.system(size: 11, weight: .semibold))
+                    .foregroundStyle(.secondary)
+                Spacer()
+                Text("\(records.count)")
+                    .font(.system(size: 10, design: .monospaced))
+                    .foregroundStyle(.tertiary)
+            }
+            .padding(.horizontal, 4)
+            .padding(.vertical, 4)
+            .frame(maxWidth: .infinity, alignment: .leading)
+            .background(Color.primary.opacity(0.001))
+            .contentShape(Rectangle())
+            .onTapGesture {
                 withAnimation(.easeInOut(duration: 0.16)) {
                     isExpanded.wrappedValue.toggle()
                 }
-            } label: {
-                HStack(alignment: .center, spacing: 5) {
-                    Image(systemName: isExpanded.wrappedValue ? "chevron.down" : "chevron.right")
-                        .font(.system(size: 8.5, weight: .bold))
-                        .foregroundStyle(.tertiary)
-                        .frame(width: 10)
-                    if let icon {
-                        Image(systemName: icon)
-                            .font(.system(size: 9))
-                            .foregroundStyle(.secondary)
-                    }
-                    Text(title)
-                        .font(.system(size: 11, weight: .semibold))
-                        .foregroundStyle(.secondary)
-                    Spacer()
-                    Text("\(records.count)")
-                        .font(.system(size: 10, design: .monospaced))
-                        .foregroundStyle(.tertiary)
-                }
-                .padding(.horizontal, 4)
-                .padding(.vertical, 2)
             }
-            .buttonStyle(.plain)
 
             if isExpanded.wrappedValue {
                 VStack(spacing: 4) {
@@ -391,63 +402,76 @@ struct MainWorkspaceView: View {
 
     private func historyRowCard(_ record: HistoryRecord) -> some View {
         let isSelected = viewModel.selectedRecordID == record.id
-        return Button {
+        let isHovered = hoveredRecordID == record.id
+        return VStack(alignment: .leading, spacing: 4) {
+            HStack(alignment: .center, spacing: 6) {
+                Circle()
+                    .fill(record.isCommitted ? palette.committedTone : palette.reminderTone)
+                    .frame(width: 5.5, height: 5.5)
+
+                Text(record.displayTitle)
+                    .font(.system(size: 12, weight: isSelected ? .semibold : .medium))
+                    .foregroundStyle(.primary)
+                    .lineLimit(1)
+
+                Spacer(minLength: 4)
+
+                if record.isPinned {
+                    Image(systemName: "pin.fill")
+                        .font(.system(size: 9))
+                        .foregroundStyle(.tertiary)
+                        .rotationEffect(.degrees(45))
+                }
+
+                Text(Self.shortTimeString(record.createdAt))
+                    .font(.system(size: 10, design: .monospaced))
+                    .foregroundStyle(.tertiary)
+                    .fixedSize()
+            }
+            .frame(maxWidth: .infinity, alignment: .leading)
+
+            if !record.rawInputText.isEmpty {
+                Text(record.rawInputText)
+                    .font(.system(size: 11))
+                    .foregroundStyle(.secondary)
+                    .lineLimit(1)
+                    .frame(maxWidth: .infinity, alignment: .leading)
+            }
+
+            Text(Self.summaryCountsLine(for: record.plan, isCommitted: record.isCommitted))
+                .font(.system(size: 10))
+                .foregroundStyle(.tertiary)
+                .frame(maxWidth: .infinity, alignment: .leading)
+        }
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .padding(.horizontal, 10)
+        .padding(.vertical, 7.5)
+        .background(
+            RoundedRectangle(cornerRadius: 8, style: .continuous)
+                .fill(
+                    isSelected
+                        ? palette.sidebarSelectedRow
+                        : (isHovered ? palette.sidebarSelectedRow.opacity(0.45) : Color.primary.opacity(0.001))
+                )
+                .shadow(color: isSelected ? Color.black.opacity(0.04) : .clear, radius: 2, x: 0, y: 1)
+                .overlay(
+                    RoundedRectangle(cornerRadius: 8, style: .continuous)
+                        .strokeBorder(isSelected ? palette.hairline : Color.clear, lineWidth: 1)
+                )
+        )
+        .contentShape(Rectangle())
+        .onTapGesture {
             withAnimation(.easeInOut(duration: 0.15)) {
                 viewModel.selectHistoryRecord(record.id)
             }
-        } label: {
-            VStack(alignment: .leading, spacing: 4) {
-                HStack(alignment: .center, spacing: 6) {
-                    Circle()
-                        .fill(record.isCommitted ? palette.committedTone : palette.reminderTone)
-                        .frame(width: 5.5, height: 5.5)
-
-                    Text(record.displayTitle)
-                        .font(.system(size: 12, weight: isSelected ? .semibold : .medium))
-                        .foregroundStyle(.primary)
-                        .lineLimit(1)
-
-                    Spacer(minLength: 4)
-
-                    if record.isPinned {
-                        Image(systemName: "pin.fill")
-                            .font(.system(size: 9))
-                            .foregroundStyle(.tertiary)
-                            .rotationEffect(.degrees(45))
-                    }
-
-                    Text(Self.shortTimeString(record.createdAt))
-                        .font(.system(size: 10, design: .monospaced))
-                        .foregroundStyle(.tertiary)
-                        .fixedSize()
-                }
-
-                if !record.rawInputText.isEmpty {
-                    Text(record.rawInputText)
-                        .font(.system(size: 11))
-                        .foregroundStyle(.secondary)
-                        .lineLimit(1)
-                        .frame(maxWidth: .infinity, alignment: .leading)
-                }
-
-                Text(Self.summaryCountsLine(for: record.plan, isCommitted: record.isCommitted))
-                    .font(.system(size: 10))
-                    .foregroundStyle(.tertiary)
-                    .frame(maxWidth: .infinity, alignment: .leading)
-            }
-            .padding(.horizontal, 10)
-            .padding(.vertical, 7.5)
-            .background(
-                RoundedRectangle(cornerRadius: 8, style: .continuous)
-                    .fill(isSelected ? palette.sidebarSelectedRow : Color.clear)
-                    .shadow(color: isSelected ? Color.black.opacity(0.04) : .clear, radius: 2, x: 0, y: 1)
-                    .overlay(
-                        RoundedRectangle(cornerRadius: 8, style: .continuous)
-                            .strokeBorder(isSelected ? palette.hairline : Color.clear, lineWidth: 1)
-                    )
-            )
         }
-        .buttonStyle(.plain)
+        .onHover { hovering in
+            if hovering {
+                hoveredRecordID = record.id
+            } else if hoveredRecordID == record.id {
+                hoveredRecordID = nil
+            }
+        }
         .contextMenu {
             Button {
                 viewModel.togglePinRecord(record.id)
@@ -581,7 +605,7 @@ struct MainWorkspaceView: View {
                             .font(.system(size: 10))
                             .foregroundStyle(.tertiary)
                     }
-                    .buttonStyle(.plain)
+                    .buttonStyle(FullHitAreaButtonStyle())
                 }
             }
             .frame(width: 175, height: 24)
@@ -808,7 +832,7 @@ struct MainWorkspaceView: View {
                             .font(.system(size: 10.5))
                             .foregroundStyle(.tertiary)
                     }
-                    .buttonStyle(.plain)
+                    .buttonStyle(FullHitAreaButtonStyle())
                 }
                 .padding(.horizontal, 7)
                 .frame(height: 22)
@@ -826,7 +850,7 @@ struct MainWorkspaceView: View {
                         .font(.system(size: 12))
                         .foregroundStyle(.tertiary)
                 }
-                .buttonStyle(.plain)
+                .buttonStyle(FullHitAreaButtonStyle())
             }
 
             Button {
@@ -847,7 +871,7 @@ struct MainWorkspaceView: View {
                         .fill(palette.subtleButtonBg)
                 )
             }
-            .buttonStyle(.plain)
+            .buttonStyle(FullHitAreaButtonStyle())
             .fixedSize()
             .disabled(viewModel.isAnalyzing)
 
@@ -875,7 +899,7 @@ struct MainWorkspaceView: View {
                         .fill(palette.primaryActionBg)
                 )
             }
-            .buttonStyle(.plain)
+            .buttonStyle(FullHitAreaButtonStyle())
             .fixedSize()
             .disabled(viewModel.isAnalyzing)
             .keyboardShortcut(.return, modifiers: [.command])
@@ -970,7 +994,7 @@ struct MainWorkspaceView: View {
                     .fill(palette.subtleButtonBg)
             )
         }
-        .buttonStyle(.plain)
+        .buttonStyle(FullHitAreaButtonStyle())
         .fixedSize()
     }
 
@@ -1097,7 +1121,7 @@ struct MainWorkspaceView: View {
                                 .fill(viewModel.selectedTotalCount > 0 ? palette.primaryActionBg : Color.secondary.opacity(0.3))
                         )
                     }
-                    .buttonStyle(.plain)
+                    .buttonStyle(FullHitAreaButtonStyle())
                     .fixedSize()
                     .disabled(viewModel.isExecuting || viewModel.selectedTotalCount == 0)
                 }
@@ -1223,42 +1247,43 @@ struct MainWorkspaceView: View {
                         .foregroundStyle(current.isSelected ? Color.primary.opacity(0.75) : Color.secondary.opacity(0.32))
                         .frame(width: 18, height: 20)
                 }
-                .buttonStyle(.plain)
+                .buttonStyle(FullHitAreaButtonStyle())
                 .padding(.trailing, 10)
             }
 
             // Col 2: 44pt Pure SwiftUI Semantic Pill
-            Button {
-                isPopoverOpen.wrappedValue.toggle()
-            } label: {
-                Text(current.targetKind.rawValue)
-                    .font(.system(size: 10.5, weight: .semibold))
-                    .foregroundStyle(activeTone)
-                    .frame(width: 44, height: 20)
-                    .background(
-                        RoundedRectangle(cornerRadius: 4.5, style: .continuous)
-                            .fill(activeTone.opacity(0.11))
-                    )
-            }
-            .buttonStyle(.plain)
-            .padding(.trailing, 12)
-            .help("点击修改类型（日历 / 提醒 / 闹钟 / 备忘）与详情")
+            Text(current.targetKind.rawValue)
+                .font(.system(size: 10.5, weight: .semibold))
+                .foregroundStyle(activeTone)
+                .frame(width: 44, height: 20)
+                .background(
+                    RoundedRectangle(cornerRadius: 4.5, style: .continuous)
+                        .fill(activeTone.opacity(0.11))
+                )
+                .contentShape(Rectangle())
+                .onTapGesture {
+                    isPopoverOpen.wrappedValue.toggle()
+                }
+                .padding(.trailing, 12)
+                .help("点击修改类型（日历 / 提醒 / 闹钟 / 备忘）与详情")
 
             // Col 3: Starts at exact X = 84pt
             VStack(alignment: .leading, spacing: 3.5) {
                 // Line 1: Clean Title + Open / Delete Actions
                 HStack(alignment: .center, spacing: 8) {
-                    Button {
-                        isPopoverOpen.wrappedValue.toggle()
-                    } label: {
+                    HStack(alignment: .center, spacing: 0) {
                         Text(current.title.isEmpty ? "未命名事项" : current.title)
                             .font(.system(size: 13, weight: .semibold))
                             .foregroundStyle(current.isCommitted ? .secondary : .primary)
                             .lineLimit(1)
+                        Spacer(minLength: 8)
                     }
-                    .buttonStyle(.plain)
-
-                    Spacer(minLength: 8)
+                    .frame(maxWidth: .infinity, alignment: .leading)
+                    .background(Color.primary.opacity(0.001))
+                    .contentShape(Rectangle())
+                    .onTapGesture {
+                        isPopoverOpen.wrappedValue.toggle()
+                    }
 
                     if current.isCommitted {
                         Button {
@@ -1278,7 +1303,7 @@ struct MainWorkspaceView: View {
                                     .fill(palette.committedTone.opacity(0.11))
                             )
                         }
-                        .buttonStyle(.plain)
+                        .buttonStyle(FullHitAreaButtonStyle())
                         .fixedSize()
                         .help("在「\(current.targetKind.systemAppName)」中打开并定位到此项")
                     }
@@ -1290,35 +1315,37 @@ struct MainWorkspaceView: View {
                             .font(.system(size: 9.5, weight: .medium))
                             .foregroundStyle(current.isCommitted ? palette.urgentTone.opacity(0.85) : Color.secondary.opacity(0.45))
                             .frame(width: 19, height: 19)
+                            .background(Color.primary.opacity(0.001))
                     }
-                    .buttonStyle(.plain)
+                    .buttonStyle(FullHitAreaButtonStyle())
                     .fixedSize()
                     .help(current.isCommitted ? "一键从系统「\(current.targetKind.systemAppName)」中删除此项" : "删除此条草稿")
                 }
 
                 // Line 2: Pure SwiftUI Single-Line Summary + Subtle Conflict Hint
-                Button {
-                    isPopoverOpen.wrappedValue.toggle()
-                } label: {
-                    HStack(alignment: .center, spacing: 6) {
-                        if let conflictTitle = viewModel.calendarConflicts[current.id], !current.isCommitted {
-                            Text("⚠️ 与「\(conflictTitle)」时间重叠")
-                                .font(.system(size: 11, weight: .medium))
-                                .foregroundStyle(palette.reminderTone)
-                                .fixedSize()
-                            Text("·")
-                                .font(.system(size: 11))
-                                .foregroundStyle(.tertiary)
-                        }
-
-                        Text(summaryDetailLine(for: current))
-                            .font(.system(size: 11.5))
-                            .foregroundStyle(.secondary)
-                            .lineLimit(1)
-                            .frame(maxWidth: .infinity, alignment: .leading)
+                HStack(alignment: .center, spacing: 6) {
+                    if let conflictTitle = viewModel.calendarConflicts[current.id], !current.isCommitted {
+                        Text("⚠️ 与「\(conflictTitle)」时间重叠")
+                            .font(.system(size: 11, weight: .medium))
+                            .foregroundStyle(palette.reminderTone)
+                            .fixedSize()
+                        Text("·")
+                            .font(.system(size: 11))
+                            .foregroundStyle(.tertiary)
                     }
+
+                    Text(summaryDetailLine(for: current))
+                        .font(.system(size: 11.5))
+                        .foregroundStyle(.secondary)
+                        .lineLimit(1)
+                        .frame(maxWidth: .infinity, alignment: .leading)
                 }
-                .buttonStyle(.plain)
+                .frame(maxWidth: .infinity, alignment: .leading)
+                .background(Color.primary.opacity(0.001))
+                .contentShape(Rectangle())
+                .onTapGesture {
+                    isPopoverOpen.wrappedValue.toggle()
+                }
             }
         }
         .padding(.vertical, 10.5)
@@ -1434,10 +1461,11 @@ struct MainWorkspaceView: View {
                         .frame(height: 26)
                         .background(
                             RoundedRectangle(cornerRadius: 6, style: .continuous)
-                                .fill(isSelected ? kindTone.opacity(0.14) : Color.clear)
+                                .fill(isSelected ? kindTone.opacity(0.14) : Color.primary.opacity(0.001))
                         )
+                        .contentShape(Rectangle())
                     }
-                    .buttonStyle(.plain)
+                    .buttonStyle(FullHitAreaButtonStyle())
                 }
             }
             .padding(3)
@@ -1523,7 +1551,7 @@ struct MainWorkspaceView: View {
                                             .fill(isCurrent ? Color.black.opacity(0.82) : Color.primary.opacity(0.06))
                                     )
                             }
-                            .buttonStyle(.plain)
+                            .buttonStyle(FullHitAreaButtonStyle())
                         }
                     }
                 }
@@ -1585,7 +1613,7 @@ struct MainWorkspaceView: View {
                         .fill(Color.primary.opacity(0.06))
                 )
         }
-        .buttonStyle(.plain)
+        .buttonStyle(FullHitAreaButtonStyle())
     }
 
     private var emptyWorkspacePlaceholder: some View {

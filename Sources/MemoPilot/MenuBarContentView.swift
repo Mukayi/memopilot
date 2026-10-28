@@ -69,7 +69,7 @@ struct MenuBarContentView: View {
                             .overlay(Capsule().strokeBorder(Color.black.opacity(0.07), lineWidth: 1))
                     )
             }
-            .buttonStyle(.plain)
+            .buttonStyle(FullHitAreaButtonStyle())
         }
     }
 
@@ -102,7 +102,7 @@ struct MenuBarContentView: View {
                     .frame(height: 24)
                     .background(RoundedRectangle(cornerRadius: 6, style: .continuous).fill(Color.black.opacity(0.045)))
                 }
-                .buttonStyle(.plain)
+                .buttonStyle(FullHitAreaButtonStyle())
                 .disabled(viewModel.isAnalyzing)
 
                 Button {
@@ -125,7 +125,7 @@ struct MenuBarContentView: View {
                     .frame(height: 24)
                     .background(RoundedRectangle(cornerRadius: 6, style: .continuous).fill(Color.black.opacity(0.045)))
                 }
-                .buttonStyle(.plain)
+                .buttonStyle(FullHitAreaButtonStyle())
                 .disabled(viewModel.isAnalyzing)
 
                 Spacer()
@@ -140,7 +140,7 @@ struct MenuBarContentView: View {
                         .frame(height: 24)
                         .background(RoundedRectangle(cornerRadius: 6, style: .continuous).fill(Color.black.opacity(0.86)))
                 }
-                .buttonStyle(.plain)
+                .buttonStyle(FullHitAreaButtonStyle())
                 .disabled(viewModel.isAnalyzing)
                 .keyboardShortcut(.return, modifiers: [.command])
             }
@@ -205,7 +205,7 @@ struct MenuBarContentView: View {
                             .fill(viewModel.selectedTotalCount > 0 ? Color.black.opacity(0.86) : Color.secondary.opacity(0.3))
                     )
             }
-            .buttonStyle(.plain)
+            .buttonStyle(FullHitAreaButtonStyle())
             .disabled(viewModel.isExecuting || viewModel.selectedTotalCount == 0)
             .padding(.top, 2)
         }
@@ -226,7 +226,7 @@ struct MenuBarContentView: View {
                     .font(.system(size: 13.5))
                     .foregroundStyle(item.isSelected ? barColor : Color.secondary.opacity(0.35))
             }
-            .buttonStyle(.plain)
+            .buttonStyle(FullHitAreaButtonStyle())
 
             VStack(alignment: .leading, spacing: 2) {
                 HStack(spacing: 6) {
@@ -287,7 +287,7 @@ struct MenuBarContentView: View {
             }
             .font(.system(size: 10))
             .foregroundStyle(.secondary)
-            .buttonStyle(.plain)
+            .buttonStyle(FullHitAreaButtonStyle())
         }
     }
 }
