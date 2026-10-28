@@ -7,10 +7,12 @@ public final class GlobalHotKeyService: @unchecked Sendable {
 
     private var toggleWindowHotKeyRef: EventHotKeyRef?
     private var captureHotKeyRef: EventHotKeyRef?
+    private var clipboardHotKeyRef: EventHotKeyRef?
     private var eventHandlerRef: EventHandlerRef?
 
     public var onToggleWindowTriggered: (@Sendable () -> Void)?
     public var onQuickScreenshotTriggered: (@Sendable () -> Void)?
+    public var onClipboardAnalyzeTriggered: (@Sendable () -> Void)?
 
     private init() {}
 
@@ -22,6 +24,10 @@ public final class GlobalHotKeyService: @unchecked Sendable {
         if let ref = captureHotKeyRef {
             UnregisterEventHotKey(ref)
             captureHotKeyRef = nil
+        }
+        if let ref = clipboardHotKeyRef {
+            UnregisterEventHotKey(ref)
+            clipboardHotKeyRef = nil
         }
         if let handler = eventHandlerRef {
             RemoveEventHandler(handler)
@@ -63,6 +69,9 @@ public final class GlobalHotKeyService: @unchecked Sendable {
                 case 2:
                     service.onQuickScreenshotTriggered?()
                     return noErr
+                case 3:
+                    service.onClipboardAnalyzeTriggered?()
+                    return noErr
                 default:
                     return OSStatus(eventNotHandledErr)
                 }
@@ -73,7 +82,7 @@ public final class GlobalHotKeyService: @unchecked Sendable {
             &eventHandlerRef
         )
 
-        // Option + Space (keycode 49 = Space) -> Toggle / Bring Window to Front
+        // 1. Option + Space (keycode 49 = Space) -> Toggle / Bring Window to Front
         let toggleHotKeyID = EventHotKeyID(signature: Self.hotKeySignature, id: 1)
         RegisterEventHotKey(
             UInt32(kVK_Space),
@@ -84,7 +93,7 @@ public final class GlobalHotKeyService: @unchecked Sendable {
             &toggleWindowHotKeyRef
         )
 
-        // Option + Shift + S (keycode 1 = 's') -> Interactive Screenshot + Analyze
+        // 2. Option + Shift + S (keycode 1 = 's') -> Interactive Screenshot + Analyze
         let captureHotKeyID = EventHotKeyID(signature: Self.hotKeySignature, id: 2)
         RegisterEventHotKey(
             UInt32(kVK_ANSI_S),
@@ -93,6 +102,17 @@ public final class GlobalHotKeyService: @unchecked Sendable {
             GetApplicationEventTarget(),
             0,
             &captureHotKeyRef
+        )
+
+        // 3. Option + C (keycode 8 = 'c') -> Parse Current Clipboard Text/Image Immediately
+        let clipboardHotKeyID = EventHotKeyID(signature: Self.hotKeySignature, id: 3)
+        RegisterEventHotKey(
+            UInt32(kVK_ANSI_C),
+            UInt32(optionKey),
+            clipboardHotKeyID,
+            GetApplicationEventTarget(),
+            0,
+            &clipboardHotKeyRef
         )
     }
 }

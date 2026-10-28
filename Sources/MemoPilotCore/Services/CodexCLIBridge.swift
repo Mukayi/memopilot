@@ -1,5 +1,6 @@
 import Foundation
 import AppKit
+import CFNetwork
 
 public enum AIProviderMode: String, CaseIterable, Identifiable, Sendable {
     case auto = "自动（优先 Cursor）"
@@ -41,6 +42,7 @@ public enum CodexCLIBridge {
         var extraPaths = [
             "\(home)/Library/Application Support/Cursor/User/globalStorage/anysphere.cursor-agent-worker/agent-cli/.local/bin",
             "/Applications/ChatGPT.app/Contents/Resources/codex-cli/bin",
+            "\(home)/.local/node/bin",
             "/opt/homebrew/bin",
             "/usr/local/bin",
             "\(home)/.npm-global/bin",
@@ -63,6 +65,33 @@ public enum CodexCLIBridge {
         }
         let existing = ProcessInfo.processInfo.environment["PATH"] ?? ""
         return (extraPaths + [existing]).joined(separator: ":")
+    }
+
+    /// Reads macOS System Proxy settings (Clash / Surge / V2Ray / System Settings)
+    /// so GUI-launched subprocesses don't hang bypassing the user's proxy.
+    public static func systemProxyEnvironment() -> [String: String] {
+        var env: [String: String] = [:]
+        guard let unmanaged = CFNetworkCopySystemProxySettings(),
+              let dict = unmanaged.takeRetainedValue() as? [String: Any] else {
+            return env
+        }
+        if let httpEnable = dict[kCFNetworkProxiesHTTPEnable as String] as? Int, httpEnable == 1,
+           let host = dict[kCFNetworkProxiesHTTPProxy as String] as? String, !host.isEmpty,
+           let port = dict[kCFNetworkProxiesHTTPPort as String] as? Int, port > 0 {
+            let url = "http://\(host):\(port)"
+            env["HTTP_PROXY"] = url
+            env["HTTPS_PROXY"] = url
+            env["http_proxy"] = url
+            env["https_proxy"] = url
+        }
+        if let socksEnable = dict[kCFNetworkProxiesSOCKSEnable as String] as? Int, socksEnable == 1,
+           let host = dict[kCFNetworkProxiesSOCKSProxy as String] as? String, !host.isEmpty,
+           let port = dict[kCFNetworkProxiesSOCKSPort as String] as? Int, port > 0 {
+            let url = "socks5://\(host):\(port)"
+            env["ALL_PROXY"] = url
+            env["all_proxy"] = url
+        }
+        return env
     }
 
     public static func findCursorAgentBinary() -> String? {
@@ -99,6 +128,7 @@ public enum CodexCLIBridge {
         let home = FileManager.default.homeDirectoryForCurrentUser.path
         let candidates = [
             "/Applications/ChatGPT.app/Contents/Resources/codex-cli/bin/codex",
+            "\(home)/.local/node/bin/codex",
             "/opt/homebrew/bin/codex",
             "/usr/local/bin/codex",
             "\(home)/.npm-global/bin/codex",
@@ -115,15 +145,31 @@ public enum CodexCLIBridge {
         return nil
     }
 
+    public static func isCodexAuthenticated(codexBinary: String?) -> Bool {
+        let home = FileManager.default.homeDirectoryForCurrentUser.path
+        if FileManager.default.fileExists(atPath: "\(home)/.codex/auth.json") {
+            return true
+        }
+        if let apiKey = ProcessInfo.processInfo.environment["OPENAI_API_KEY"], !apiKey.isEmpty {
+            return true
+        }
+        guard let bin = codexBinary else { return false }
+        if let statusOut = try? runProcess(bin, arguments: ["login", "status"], timeout: 2.5) {
+            let lower = statusOut.lowercased()
+            if !lower.contains("not logged in") && !lower.contains("no codex credentials") && !lower.isEmpty {
+                return true
+            }
+        }
+        return false
+    }
+
     public static func checkStatus(preferredMode: AIProviderMode = .auto) -> CodexEnvironmentStatus {
         let cursorBin = findCursorAgentBinary()
         let cursorKey = discoverCursorApiKey()
         let isCursorReady = (cursorBin != nil && cursorKey != nil)
 
         let codexBin = findCodexBinary()
-        let home = FileManager.default.homeDirectoryForCurrentUser.path
-        let hasCodexAuthFile = FileManager.default.fileExists(atPath: "\(home)/.codex/auth.json")
-        let isCodexReady = (codexBin != nil && hasCodexAuthFile)
+        let isCodexReady = isCodexAuthenticated(codexBinary: codexBin)
 
         switch preferredMode {
         case .cursor:
@@ -170,8 +216,8 @@ public enum CodexCLIBridge {
             codexBinaryPath: codexBin,
             cursorBinaryPath: cursorBin,
             isLoggedIn: false,
-            activeProviderLabel: "点击连接 AI",
-            statusMessage: "请保持 Cursor 开启，或点击登录 OpenAI 账号"
+            activeProviderLabel: "点击登录 AI",
+            statusMessage: "请保持 Cursor 开启，或点击「终端登录 OpenAI Codex…」完成网页授权"
         )
     }
 
@@ -206,6 +252,11 @@ public enum CodexCLIBridge {
 
     public static func analyze(userText: String, imagePath: String?, preferredMode: AIProviderMode = .auto) async throws -> ParsedPlan {
         try await Task.detached(priority: .userInitiated) {
+            // Create an isolated empty working directory so neither cursor-agent nor codex ever scans `/` (Finder launch cwd)!
+            let tempDir = FileManager.default.temporaryDirectory.appendingPathComponent("MemoPilot-\(UUID().uuidString)")
+            try FileManager.default.createDirectory(at: tempDir, withIntermediateDirectories: true)
+            defer { try? FileManager.default.removeItem(at: tempDir) }
+
             // 1. Run local Apple Vision OCR on background thread if image is attached
             var combinedText = userText
             if let imagePath, !imagePath.isEmpty {
@@ -218,14 +269,13 @@ public enum CodexCLIBridge {
             }
 
             // 2. Try Cursor Agent Direct Connection first if preferred or in auto mode
-            // Note: cursor-agent takes text prompt; if user provided only an image and OCR found 0 text, skip text-only cursor-agent if Codex multimodal is available
             let hasUsableTextForCursor = !combinedText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
             if preferredMode != .openai,
                hasUsableTextForCursor,
                let cursorBin = findCursorAgentBinary(),
                let cursorKey = discoverCursorApiKey() {
                 let prompt = PromptBuilder.buildPrompt(userText: combinedText, hasImage: imagePath != nil)
-                let schemaInstruction = "\n\n请只输出一个合法的 JSON 对象（不要用 markdown 代码块包裹，不要任何多余解释），必须严格包含 summary, events, reminders, notes 四个顶级字段，结构遵循：\n\(PromptBuilder.outputJSONSchema)"
+                let schemaInstruction = "\n\n请只输出一个合法的 JSON 对象（不要调用任何工具，不要用 markdown 代码块包裹，不要任何多余解释），必须严格包含 summary, events, reminders, notes 四个顶级字段，结构遵循：\n\(PromptBuilder.outputJSONSchema)"
                 let fullPrompt = prompt + schemaInstruction
 
                 do {
@@ -234,15 +284,16 @@ public enum CodexCLIBridge {
                         arguments: [
                             "--api-key", cursorKey,
                             "--trust",
+                            "--workspace", tempDir.path,
                             "-p",
                             "--mode", "ask",
                             fullPrompt
                         ],
-                        timeout: 90.0
+                        workingDirectoryURL: tempDir,
+                        timeout: 60.0
                     )
                     return try ParsedPlan.decode(from: output)
                 } catch {
-                    // Clear potentially stale cached key
                     UserDefaults.standard.removeObject(forKey: "MemoPilot.cachedCursorApiKey")
                     if preferredMode == .cursor {
                         throw error
@@ -263,22 +314,41 @@ public enum CodexCLIBridge {
                 throw NSError(
                     domain: "MemoPilot.AI",
                     code: 404,
-                    userInfo: [NSLocalizedDescriptionKey: "未检测到可用的 Cursor 连接或 OpenAI Codex 登录状态。"]
+                    userInfo: [NSLocalizedDescriptionKey: "未检测到可用的 Cursor 连接或 OpenAI Codex CLI。请点击右上角连接 AI。"]
                 )
             }
 
-            let tempDir = FileManager.default.temporaryDirectory.appendingPathComponent("MemoPilot-\(UUID().uuidString)")
-            try FileManager.default.createDirectory(at: tempDir, withIntermediateDirectories: true)
-            defer { try? FileManager.default.removeItem(at: tempDir) }
+            // Verify Codex is actually logged in before running `codex exec` (prevents 90s unauthenticated retry loop)
+            guard isCodexAuthenticated(codexBinary: codexPath) else {
+                throw NSError(
+                    domain: "MemoPilot.CodexAuth",
+                    code: 401,
+                    userInfo: [NSLocalizedDescriptionKey: "尚未登录 OpenAI Codex 账号。请点击窗口右上角「点击登录 AI → 终端登录 OpenAI Codex…」完成授权后再试。"]
+                )
+            }
 
             let schemaURL = tempDir.appendingPathComponent("schema.json")
             let outputURL = tempDir.appendingPathComponent("output.json")
             try PromptBuilder.outputJSONSchema.write(to: schemaURL, atomically: true, encoding: .utf8)
 
             let prompt = PromptBuilder.buildPrompt(userText: combinedText, hasImage: imagePath != nil)
+                + "\n\n注意：请直接生成最终 JSON，绝不要调用任何 shell 命令或外部工具。"
 
+            // Strip all heavy desktop MCP servers (e.g. node_repl 120s timeout), plugins, shell snapshots,
+            // and force low reasoning effort + system proxy support for 2-5s response latency.
             var args: [String] = [
                 "exec",
+                "--ignore-user-config",
+                "--ephemeral",
+                "-C", tempDir.path,
+                "-c", "model_reasoning_effort=\"low\"",
+                "--enable", "respect_system_proxy",
+                "--disable", "shell_tool",
+                "--disable", "shell_snapshot",
+                "--disable", "plugins",
+                "--disable", "apps",
+                "--disable", "browser_use",
+                "--disable", "computer_use",
                 "--skip-git-repo-check",
                 "--sandbox", "read-only",
                 "--output-schema", schemaURL.path,
@@ -289,12 +359,18 @@ public enum CodexCLIBridge {
             }
             args.append(prompt)
 
-            _ = try runProcess(codexPath, arguments: args, timeout: 90.0)
+            let processOut = try runProcess(
+                codexPath,
+                arguments: args,
+                workingDirectoryURL: tempDir,
+                timeout: 75.0
+            )
             guard FileManager.default.fileExists(atPath: outputURL.path) else {
+                let detail = processOut.trimmingCharacters(in: .whitespacesAndNewlines)
                 throw NSError(
                     domain: "MemoPilot.Codex",
                     code: 500,
-                    userInfo: [NSLocalizedDescriptionKey: "AI 未返回结构化结果，请保持 Cursor 开启或点击右上角连接 OpenAI。"]
+                    userInfo: [NSLocalizedDescriptionKey: "OpenAI 未返回结构化结果（请检查代理网络或右上角重新登录 OpenAI）。\(detail.isEmpty ? "" : "\n详情：\(String(detail.suffix(180)))")"]
                 )
             }
             let rawJSON = try String(contentsOf: outputURL, encoding: .utf8)
@@ -306,15 +382,23 @@ public enum CodexCLIBridge {
     private static func runProcess(
         _ executable: String,
         arguments: [String],
-        timeout: TimeInterval = 90.0
+        workingDirectoryURL: URL? = nil,
+        timeout: TimeInterval = 75.0
     ) throws -> String {
         let process = Process()
         process.executableURL = URL(fileURLWithPath: executable)
         process.arguments = arguments
         process.standardInput = FileHandle.nullDevice
+        if let workingDirectoryURL {
+            process.currentDirectoryURL = workingDirectoryURL
+        }
 
         var env = ProcessInfo.processInfo.environment
         env["PATH"] = augmentedPATH()
+        // Inject macOS System Proxy if not already set in environment
+        for (k, v) in systemProxyEnvironment() where env[k] == nil {
+            env[k] = v
+        }
         process.environment = env
 
         let outPipe = Pipe()
@@ -324,7 +408,6 @@ public enum CodexCLIBridge {
 
         try process.run()
 
-        // Concurrent pipe draining prevents 64KB OS pipe buffer deadlocks
         let group = DispatchGroup()
         nonisolated(unsafe) var outData = Data()
         nonisolated(unsafe) var errData = Data()
@@ -347,7 +430,7 @@ public enum CodexCLIBridge {
             throw NSError(
                 domain: "MemoPilot.Process",
                 code: NSURLErrorTimedOut,
-                userInfo: [NSLocalizedDescriptionKey: "AI 响应超时（>\(Int(timeout))秒），请重试。"]
+                userInfo: [NSLocalizedDescriptionKey: "AI 响应超时（>\(Int(timeout))秒），请检查网络连接/系统代理或重试。"]
             )
         }
 
@@ -363,6 +446,6 @@ public enum CodexCLIBridge {
                 userInfo: [NSLocalizedDescriptionKey: "命令执行失败 (\(process.terminationStatus)): \(stderr.isEmpty ? stdout : stderr)"]
             )
         }
-        return stdout
+        return stdout.isEmpty ? stderr : stdout
     }
 }

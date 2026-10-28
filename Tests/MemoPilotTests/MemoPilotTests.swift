@@ -225,4 +225,28 @@ struct MemoPilotTests {
         #expect(plan.events[0].location == "T2 航站楼值机柜台")
         #expect(plan.events[0].leadTimeMinutes == [180, 60])
     }
+
+    @Test("AppleNotesWatcherService tracks processed notes and strips processed markers")
+    func appleNotesWatcherStateTracking() throws {
+        let tempDir = FileManager.default.temporaryDirectory.appendingPathComponent("MemoPilotNotesWatchTest-\(UUID().uuidString)")
+        defer { try? FileManager.default.removeItem(at: tempDir) }
+
+        let watcher = AppleNotesWatcherService(baseDirectoryURL: tempDir)
+        let rawNote = "周四下午4点开产品会\n\(AppleNotesWatcherService.processedMarker)：已生成草稿"
+        #expect(AppleNotesWatcherService.normalizeNoteText(rawNote) == "周四下午4点开产品会")
+        #expect(watcher.isNoteAlreadyProcessed(noteID: "note-1", plaintext: rawNote) == true)
+
+        let freshNote = "周五晚上7点健身"
+        #expect(watcher.isNoteAlreadyProcessed(noteID: "note-2", plaintext: freshNote) == false)
+        watcher.recordNoteProcessed(noteID: "note-2", plaintext: freshNote)
+        #expect(watcher.isNoteAlreadyProcessed(noteID: "note-2", plaintext: freshNote) == true)
+        #expect(watcher.isNoteAlreadyProcessed(noteID: "note-2", plaintext: "周五晚上7点健身（改到8点）") == false)
+    }
+
+    @Test("CodexCLIBridge augmentedPATH includes local node bin and proxy helper executes safely")
+    func codexBridgePathAndProxyResolution() {
+        let path = CodexCLIBridge.augmentedPATH()
+        #expect(path.contains(".local/node/bin"))
+        _ = CodexCLIBridge.systemProxyEnvironment()
+    }
 }

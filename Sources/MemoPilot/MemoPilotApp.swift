@@ -41,6 +41,17 @@ final class AppViewModel: ObservableObject {
             UserDefaults.standard.set(autoCommit, forKey: "MemoPilot.autoCommit")
         }
     }
+    @Published var isNotesAutoWatchEnabled: Bool = {
+        if UserDefaults.standard.object(forKey: "MemoPilot.isNotesAutoWatchEnabled") == nil {
+            return true
+        }
+        return UserDefaults.standard.bool(forKey: "MemoPilot.isNotesAutoWatchEnabled")
+    }() {
+        didSet {
+            UserDefaults.standard.set(isNotesAutoWatchEnabled, forKey: "MemoPilot.isNotesAutoWatchEnabled")
+        }
+    }
+    @Published var isSyncingNotes: Bool = false
     @Published var aiProviderMode: AIProviderMode = AIProviderMode(
         rawValue: UserDefaults.standard.string(forKey: "MemoPilot.aiProviderMode") ?? ""
     ) ?? .auto {
@@ -77,6 +88,7 @@ final class AppViewModel: ObservableObject {
     private var saveDebounceTask: Task<Void, Never>?
     private var notificationObserver: NSObjectProtocol?
     private var remotePollingTimer: Timer?
+    private var notesWatchTimer: Timer?
     private var hasStartedListeners = false
     private var isHandlingRemote = false
 
@@ -167,6 +179,12 @@ final class AppViewModel: ObservableObject {
                 AppDelegate.bringMainWindowToFront()
             }
         }
+        GlobalHotKeyService.shared.onClipboardAnalyzeTriggered = { [weak self] in
+            Task { @MainActor in
+                AppDelegate.bringMainWindowToFront()
+                await self?.analyzeClipboard()
+            }
+        }
         GlobalHotKeyService.shared.registerDefaultHotKeys()
 
         // Clean up any stale command left from a previous session
@@ -199,6 +217,18 @@ final class AppViewModel: ObservableObject {
         }
         RunLoop.main.add(timer, forMode: .common)
         remotePollingTimer = timer
+
+        let notesTimer = Timer(timeInterval: 15.0, repeats: true) { [weak self] _ in
+            Task { @MainActor in
+                guard let self,
+                      self.isNotesAutoWatchEnabled,
+                      !self.isAnalyzing,
+                      !self.isSyncingNotes else { return }
+                await self.syncAppleNotesFolder(manualTrigger: false)
+            }
+        }
+        RunLoop.main.add(notesTimer, forMode: .common)
+        notesWatchTimer = notesTimer
 
         refreshCodexStatus()
     }
@@ -386,6 +416,14 @@ final class AppViewModel: ObservableObject {
         case "load-demo":
             loadDemoPlan()
             CursorRemoteControl.writeResponse("✅ 已加载示例记录")
+
+        case "clipboard":
+            await analyzeClipboard()
+            CursorRemoteControl.writeResponse("✅ 已执行剪贴板拆解：\(statusBanner ?? "")")
+
+        case "sync-notes":
+            await syncAppleNotesFolder(manualTrigger: true)
+            CursorRemoteControl.writeResponse("✅ 已执行苹果备忘录同步：\(statusBanner ?? "")")
 
         case "screenshot":
             let outPath = cmd.text ?? "/Users/xiatianze/Desktop/MemoPilot/docs/live-cursor-operated.png"
@@ -636,6 +674,113 @@ final class AppViewModel: ObservableObject {
         } catch {
             isErrorBanner = true
             statusBanner = "截图失败：\(error.localizedDescription)"
+        }
+    }
+
+    func analyzeClipboard() async {
+        guard !isAnalyzing else { return }
+        guard let payload = ClipboardService.readPayload() else {
+            withAnimation(.easeInOut(duration: 0.2)) {
+                isErrorBanner = true
+                statusBanner = "剪贴板为空（请先复制一段微信/网页文字或图片，再按 ⌥C）"
+            }
+            return
+        }
+        withAnimation(.easeInOut(duration: 0.18)) {
+            isInputCollapsed = false
+            if !payload.text.isEmpty {
+                inputText = payload.text
+            }
+            if let img = payload.imagePath {
+                attachedImagePath = img
+            }
+            isErrorBanner = false
+            statusBanner = "📋 已读取剪贴板内容，正在智能拆解…"
+        }
+        await runAnalysis()
+    }
+
+    func syncAppleNotesFolder(manualTrigger: Bool = false) async {
+        guard !isSyncingNotes, !isAnalyzing else { return }
+        isSyncingNotes = true
+        defer { isSyncingNotes = false }
+
+        if manualTrigger {
+            withAnimation(.easeInOut(duration: 0.18)) {
+                isErrorBanner = false
+                statusBanner = "📒 正在扫描苹果「备忘录 > MemoPilot」文件夹中的新笔记…"
+            }
+        }
+
+        do {
+            let newNotes = try await AppleNotesWatcherService.shared.fetchUnprocessedNotes()
+            guard !newNotes.isEmpty else {
+                if manualTrigger {
+                    withAnimation(.easeInOut(duration: 0.18)) {
+                        isErrorBanner = false
+                        statusBanner = "📒 「备忘录 > MemoPilot」文件夹暂无新笔记（在 iPhone/Mac 备忘录该文件夹新建笔记即可自动同步）"
+                    }
+                }
+                return
+            }
+
+            var syncedCount = 0
+            for note in newNotes {
+                let cleanText = AppleNotesWatcherService.normalizeNoteText(note.plaintext)
+                guard !cleanText.isEmpty else { continue }
+
+                withAnimation(.easeInOut(duration: 0.18)) {
+                    isAnalyzing = true
+                    isErrorBanner = false
+                    statusBanner = "📒 检测到备忘录「\(note.title)」，正在自动拆解…"
+                }
+
+                do {
+                    let plan = try await CodexCLIBridge.analyze(
+                        userText: cleanText,
+                        imagePath: nil,
+                        preferredMode: aiProviderMode
+                    )
+                    let record = HistoryRecord(
+                        createdAt: Date(),
+                        rawInputText: "【备忘录同步】\(cleanText)",
+                        savedImagePath: nil,
+                        plan: plan,
+                        isCommitted: false
+                    )
+
+                    await AppleNotesWatcherService.shared.markNoteAsProcessed(note: note, summary: plan.summary)
+
+                    AppDelegate.clearAnyWindowFirstResponder()
+                    withAnimation(.spring(response: 0.32, dampingFraction: 0.84)) {
+                        selectedFilter = .all
+                        searchQuery = ""
+                        historyRecords.insert(record, at: 0)
+                        selectedRecordID = record.id
+                        parsedPlan = plan
+                        isAnalyzing = false
+                        historyStore.saveAll(historyRecords)
+                    }
+                    syncedCount += 1
+
+                    if autoCommit {
+                        await commitCurrentPlan()
+                    } else {
+                        statusBanner = "📒 已从苹果备忘录自动同步 \(syncedCount) 篇笔记：\(plan.summary)"
+                    }
+                } catch {
+                    isAnalyzing = false
+                    if manualTrigger {
+                        isErrorBanner = true
+                        statusBanner = "备忘录「\(note.title)」拆解失败：\(error.localizedDescription)"
+                    }
+                }
+            }
+        } catch {
+            if manualTrigger {
+                isErrorBanner = true
+                statusBanner = "访问苹果备忘录失败：\(error.localizedDescription)"
+            }
         }
     }
 

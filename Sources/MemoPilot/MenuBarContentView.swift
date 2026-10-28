@@ -87,7 +87,24 @@ struct MenuBarContentView: View {
 
             Divider().opacity(0.45)
 
-            HStack(alignment: .center, spacing: 8) {
+            HStack(alignment: .center, spacing: 6) {
+                Button {
+                    Task { await viewModel.analyzeClipboard() }
+                } label: {
+                    HStack(spacing: 4) {
+                        Image(systemName: "doc.on.clipboard")
+                            .font(.system(size: 10.5))
+                        Text("剪贴板 ⌥C")
+                            .font(.system(size: 11, weight: .medium))
+                    }
+                    .foregroundStyle(.secondary)
+                    .padding(.horizontal, 8)
+                    .frame(height: 24)
+                    .background(RoundedRectangle(cornerRadius: 6, style: .continuous).fill(Color.black.opacity(0.045)))
+                }
+                .buttonStyle(.plain)
+                .disabled(viewModel.isAnalyzing)
+
                 Button {
                     if let keyWin = NSApp.keyWindow, keyWin !== AppDelegate.mainWindow {
                         keyWin.orderOut(nil)

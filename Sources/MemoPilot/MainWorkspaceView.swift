@@ -607,6 +607,25 @@ struct MainWorkspaceView: View {
 
                 Divider()
 
+                Section("苹果「备忘录」无感同步") {
+                    Button {
+                        viewModel.isNotesAutoWatchEnabled.toggle()
+                    } label: {
+                        Label(
+                            viewModel.isNotesAutoWatchEnabled ? "已开启：自动监听「MemoPilot」文件夹" : "已关闭：自动监听「MemoPilot」文件夹",
+                            systemImage: viewModel.isNotesAutoWatchEnabled ? "checkmark.circle.fill" : "circle"
+                        )
+                    }
+
+                    Button {
+                        Task { await viewModel.syncAppleNotesFolder(manualTrigger: true) }
+                    } label: {
+                        Label("立即扫描「备忘录 > MemoPilot」新笔记", systemImage: "arrow.triangle.2.circlepath")
+                    }
+                }
+
+                Divider()
+
                 Button {
                     viewModel.autoCommit.toggle()
                 } label: {
@@ -730,6 +749,50 @@ struct MainWorkspaceView: View {
                 }
                 .buttonStyle(.plain)
             }
+
+            Button {
+                Task { await viewModel.analyzeClipboard() }
+            } label: {
+                HStack(alignment: .center, spacing: 4) {
+                    Image(systemName: "doc.on.clipboard")
+                        .font(.system(size: 10.5, weight: .medium))
+                    Text("剪贴板 ⌥C")
+                        .font(.system(size: 11, weight: .medium))
+                }
+                .foregroundStyle(.secondary)
+                .padding(.horizontal, 8.5)
+                .frame(height: 26)
+                .background(
+                    RoundedRectangle(cornerRadius: 6, style: .continuous)
+                        .fill(palette.subtleButtonBg)
+                )
+            }
+            .buttonStyle(.plain)
+            .fixedSize()
+            .disabled(viewModel.isAnalyzing)
+            .help("一键读取当前剪贴板中的文字或图片并智能拆解 (全局快捷键 ⌥C)")
+
+            Button {
+                Task { await viewModel.syncAppleNotesFolder(manualTrigger: true) }
+            } label: {
+                HStack(alignment: .center, spacing: 4) {
+                    Image(systemName: "note.text")
+                        .font(.system(size: 10.5, weight: .medium))
+                    Text("同步备忘录")
+                        .font(.system(size: 11, weight: .medium))
+                }
+                .foregroundStyle(.secondary)
+                .padding(.horizontal, 8.5)
+                .frame(height: 26)
+                .background(
+                    RoundedRectangle(cornerRadius: 6, style: .continuous)
+                        .fill(palette.subtleButtonBg)
+                )
+            }
+            .buttonStyle(.plain)
+            .fixedSize()
+            .disabled(viewModel.isAnalyzing || viewModel.isSyncingNotes)
+            .help("扫描苹果「备忘录 > MemoPilot」文件夹中的新笔记并自动拆解（后台每 15 秒也会自动同步）")
 
             Button {
                 Task { await viewModel.captureScreenAndAnalyze() }
