@@ -594,33 +594,7 @@ struct MainWorkspaceView: View {
                     )
             )
 
-            // Shortcut Customization Popover Button
-            Button {
-                viewModel.isShowingShortcutSettings.toggle()
-            } label: {
-                HStack(alignment: .center, spacing: 4) {
-                    Image(systemName: "keyboard")
-                        .font(.system(size: 11, weight: .medium))
-                    Text("快捷键")
-                        .font(.system(size: 11, weight: .medium))
-                }
-                .foregroundStyle(.secondary)
-                .padding(.horizontal, 8)
-                .frame(height: 24)
-                .background(
-                    Capsule()
-                        .fill(palette.composerWellBg)
-                        .overlay(Capsule().strokeBorder(palette.hairline, lineWidth: 1))
-                )
-            }
-            .buttonStyle(.plain)
-            .fixedSize()
-            .help("自定义全局快捷键（呼出窗口 / 剪贴板拆解 / 截图识别）")
-            .popover(isPresented: $viewModel.isShowingShortcutSettings, arrowEdge: .bottom) {
-                ShortcutSettingsPopoverView(viewModel: viewModel)
-            }
-
-            // Unified Theme & Options Menu
+            // Unified Theme, Shortcuts & Options Menu
             Menu {
                 Section("界面底色") {
                     ForEach(WorkspaceTheme.allCases) { themeOption in
@@ -637,6 +611,20 @@ struct MainWorkspaceView: View {
                             }
                         }
                     }
+                }
+
+                Divider()
+
+                Button {
+                    viewModel.isShowingShortcutSettings = true
+                } label: {
+                    Label("自定义全局快捷键…", systemImage: "keyboard")
+                }
+
+                Button {
+                    Task { await viewModel.analyzeClipboard() }
+                } label: {
+                    Label("读取剪贴板并拆解 (\(viewModel.hotKeyConfig.clipboardAnalyze.displayString))", systemImage: "doc.on.clipboard")
                 }
 
                 Divider()
@@ -705,6 +693,9 @@ struct MainWorkspaceView: View {
             }
             .menuStyle(.borderlessButton)
             .fixedSize()
+            .popover(isPresented: $viewModel.isShowingShortcutSettings, arrowEdge: .bottom) {
+                ShortcutSettingsPopoverView(viewModel: viewModel)
+            }
 
             connectionStatusBadge
         }
@@ -802,58 +793,13 @@ struct MainWorkspaceView: View {
             }
 
             Button {
-                Task { await viewModel.analyzeClipboard() }
-            } label: {
-                let badge = viewModel.hotKeyConfig.clipboardAnalyze.shortBadge
-                HStack(alignment: .center, spacing: 4) {
-                    Image(systemName: "doc.on.clipboard")
-                        .font(.system(size: 10.5, weight: .medium))
-                    Text(badge.isEmpty ? "剪贴板" : "剪贴板 \(badge)")
-                        .font(.system(size: 11, weight: .medium))
-                }
-                .foregroundStyle(.secondary)
-                .padding(.horizontal, 8.5)
-                .frame(height: 26)
-                .background(
-                    RoundedRectangle(cornerRadius: 6, style: .continuous)
-                        .fill(palette.subtleButtonBg)
-                )
-            }
-            .buttonStyle(.plain)
-            .fixedSize()
-            .disabled(viewModel.isAnalyzing)
-            .help("一键读取当前剪贴板中的文字或图片并智能拆解")
-
-            Button {
-                Task { await viewModel.syncAppleNotesFolder(manualTrigger: true) }
-            } label: {
-                HStack(alignment: .center, spacing: 4) {
-                    Image(systemName: "note.text")
-                        .font(.system(size: 10.5, weight: .medium))
-                    Text("同步备忘录")
-                        .font(.system(size: 11, weight: .medium))
-                }
-                .foregroundStyle(.secondary)
-                .padding(.horizontal, 8.5)
-                .frame(height: 26)
-                .background(
-                    RoundedRectangle(cornerRadius: 6, style: .continuous)
-                        .fill(palette.subtleButtonBg)
-                )
-            }
-            .buttonStyle(.plain)
-            .fixedSize()
-            .disabled(viewModel.isAnalyzing || viewModel.isSyncingNotes)
-            .help("扫描苹果「备忘录 > MemoPilot」文件夹中的新笔记并自动拆解（后台每 15 秒也会自动同步）")
-
-            Button {
                 Task { await viewModel.captureScreenAndAnalyze() }
             } label: {
                 let badge = viewModel.hotKeyConfig.quickScreenshot.shortBadge
                 HStack(alignment: .center, spacing: 4) {
                     Image(systemName: "viewfinder")
                         .font(.system(size: 11, weight: .medium))
-                    Text(badge.isEmpty ? "截图识别" : "截图识别 \(badge)")
+                    Text(badge.isEmpty ? "截图" : "截图 \(badge)")
                         .font(.system(size: 11, weight: .medium))
                 }
                 .foregroundStyle(.secondary)
@@ -1109,7 +1055,7 @@ struct MainWorkspaceView: View {
             if !pending.isEmpty {
                 if hasBoth {
                     sectionStatusHeader(
-                        title: "待写入草稿 (\(pending.count))",
+                        title: "待写入 (\(pending.count))",
                         dotColor: palette.reminderTone
                     )
                 }
@@ -1124,15 +1070,18 @@ struct MainWorkspaceView: View {
                 }
             }
 
-            // 2. Committed Items Section (Visually separated so already-written items are clear & never double-committed)
+            // 2. Committed Items Section
             if !committed.isEmpty {
                 if hasBoth {
                     Rectangle()
                         .fill(palette.hairline)
                         .frame(height: 1)
-                        .padding(.vertical, 8)
+                        .padding(.vertical, 6)
                 }
-                committedSectionHeader(committedItems: committed)
+                sectionStatusHeader(
+                    title: "已写入 (\(committed.count))",
+                    dotColor: palette.committedTone
+                )
                 ForEach(committed) { item in
                     editableDraftRow(item: item)
                     if item.id != committed.last?.id {
@@ -1146,7 +1095,7 @@ struct MainWorkspaceView: View {
         }
     }
 
-    private func sectionStatusHeader(title: String, dotColor: Color, hint: String? = nil) -> some View {
+    private func sectionStatusHeader(title: String, dotColor: Color) -> some View {
         HStack(alignment: .center, spacing: 6) {
             Circle()
                 .fill(dotColor)
@@ -1154,48 +1103,9 @@ struct MainWorkspaceView: View {
             Text(title)
                 .font(.system(size: 11, weight: .semibold))
                 .foregroundStyle(.secondary)
-            if let hint {
-                Text("· \(hint)")
-                    .font(.system(size: 10.5))
-                    .foregroundStyle(.tertiary)
-            }
             Spacer()
         }
-        .padding(.top, 10)
-        .padding(.bottom, 2)
-    }
-
-    private func committedSectionHeader(committedItems: [DraftItem]) -> some View {
-        let hasCalendar = committedItems.contains { $0.targetKind == .calendar }
-        let hasReminder = committedItems.contains { $0.targetKind == .reminder || $0.targetKind == .alarm }
-        let hasNote     = committedItems.contains { $0.targetKind == .note }
-
-        return HStack(alignment: .center, spacing: 6) {
-            Circle()
-                .fill(palette.committedTone)
-                .frame(width: 5.5, height: 5.5)
-            Text("已写入系统 (\(committedItems.count))")
-                .font(.system(size: 11, weight: .semibold))
-                .foregroundStyle(.secondary)
-            Text("· 点击条目右侧可直达对应应用")
-                .font(.system(size: 10.5))
-                .foregroundStyle(.tertiary)
-
-            Spacer()
-
-            HStack(spacing: 6) {
-                if hasCalendar {
-                    quickOpenAppPill(title: "打开日历", kind: .calendar)
-                }
-                if hasReminder {
-                    quickOpenAppPill(title: "打开提醒事项", kind: .reminder)
-                }
-                if hasNote {
-                    quickOpenAppPill(title: "打开备忘录", kind: .note)
-                }
-            }
-        }
-        .padding(.top, 10)
+        .padding(.top, 8)
         .padding(.bottom, 2)
     }
 
@@ -1258,7 +1168,7 @@ struct MainWorkspaceView: View {
 
             // Col 3: Starts at exact X = 84pt
             VStack(alignment: .leading, spacing: 3.5) {
-                // Line 1: Clean Title + Subtle Edit / Delete Buttons
+                // Line 1: Clean Title + at most ONE subtle action on right
                 HStack(alignment: .center, spacing: 8) {
                     Button {
                         isPopoverOpen.wrappedValue.toggle()
@@ -1270,69 +1180,30 @@ struct MainWorkspaceView: View {
                     }
                     .buttonStyle(.plain)
 
+                    Spacer(minLength: 8)
+
                     if current.isCommitted {
                         Button {
                             AppleExecutors.openInTargetApp(for: current)
                         } label: {
-                            HStack(alignment: .center, spacing: 3) {
-                                Image(systemName: "checkmark.seal.fill")
-                                    .font(.system(size: 9))
-                                Text("已写入 · 打开\(current.targetKind.systemAppName)")
-                                    .font(.system(size: 9.5, weight: .medium))
+                            HStack(alignment: .center, spacing: 2.5) {
+                                Text("打开\(current.targetKind.systemAppName)")
+                                    .font(.system(size: 10.5, weight: .medium))
                                 Image(systemName: "arrow.up.right")
                                     .font(.system(size: 8, weight: .bold))
                             }
                             .foregroundStyle(palette.committedTone)
-                            .padding(.horizontal, 6.5)
-                            .frame(height: 18)
-                            .background(
-                                RoundedRectangle(cornerRadius: 4, style: .continuous)
-                                    .fill(palette.committedTone.opacity(0.12))
-                            )
-                        }
-                        .buttonStyle(.plain)
-                        .fixedSize()
-                        .help("点击在系统「\(current.targetKind.systemAppName)」中打开并定位到此条记录")
-                    }
-
-                    Spacer(minLength: 8)
-
-                    Button {
-                        AppleExecutors.openInTargetApp(for: current)
-                    } label: {
-                        HStack(alignment: .center, spacing: 2.5) {
-                            Text(current.targetKind.systemAppName)
-                                .font(.system(size: 10.5, weight: .medium))
-                            Image(systemName: "arrow.up.right")
-                                .font(.system(size: 8.5, weight: .bold))
-                        }
-                        .foregroundStyle(.secondary)
-                        .padding(.horizontal, 7)
-                        .frame(height: 19)
-                        .background(
-                            RoundedRectangle(cornerRadius: 4, style: .continuous)
-                                .fill(palette.subtleButtonBg)
-                        )
-                    }
-                    .buttonStyle(.plain)
-                    .fixedSize()
-                    .help("一键跳转到系统「\(current.targetKind.systemAppName)」查看")
-
-                    Button {
-                        isPopoverOpen.wrappedValue.toggle()
-                    } label: {
-                        Text("修改")
-                            .font(.system(size: 10.5, weight: .medium))
-                            .foregroundStyle(.secondary)
                             .padding(.horizontal, 7)
                             .frame(height: 19)
                             .background(
                                 RoundedRectangle(cornerRadius: 4, style: .continuous)
-                                    .fill(palette.subtleButtonBg)
+                                    .fill(palette.committedTone.opacity(0.11))
                             )
+                        }
+                        .buttonStyle(.plain)
+                        .fixedSize()
+                        .help("在「\(current.targetKind.systemAppName)」中打开并定位到此项")
                     }
-                    .buttonStyle(.plain)
-                    .fixedSize()
 
                     Button {
                         viewModel.deleteDraftItem(id: item.id)
