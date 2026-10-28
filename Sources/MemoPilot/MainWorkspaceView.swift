@@ -713,14 +713,31 @@ struct MainWorkspaceView: View {
 
     private var connectionStatusBadge: some View {
         Menu {
-            ForEach(AIProviderMode.allCases) { mode in
-                Button {
-                    viewModel.aiProviderMode = mode
-                } label: {
-                    HStack {
-                        Text(mode.rawValue)
-                        if viewModel.aiProviderMode == mode {
-                            Image(systemName: "checkmark")
+            Section("AI 通道选择") {
+                ForEach(AIProviderMode.allCases) { mode in
+                    Button {
+                        viewModel.aiProviderMode = mode
+                    } label: {
+                        HStack {
+                            Text(mode.rawValue)
+                            if viewModel.aiProviderMode == mode {
+                                Image(systemName: "checkmark")
+                            }
+                        }
+                    }
+                }
+            }
+            Divider()
+            Section("拆解速度与思考力度") {
+                ForEach(AISpeedProfile.allCases) { profile in
+                    Button {
+                        viewModel.aiSpeedProfile = profile
+                    } label: {
+                        HStack {
+                            Text(profile.rawValue)
+                            if viewModel.aiSpeedProfile == profile {
+                                Image(systemName: "checkmark")
+                            }
                         }
                     }
                 }

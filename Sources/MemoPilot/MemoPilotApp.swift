@@ -60,6 +60,13 @@ final class AppViewModel: ObservableObject {
             refreshCodexStatus()
         }
     }
+    @Published var aiSpeedProfile: AISpeedProfile = AISpeedProfile(
+        rawValue: UserDefaults.standard.string(forKey: "MemoPilot.aiSpeedProfile") ?? ""
+    ) ?? .flash {
+        didSet {
+            UserDefaults.standard.set(aiSpeedProfile.rawValue, forKey: "MemoPilot.aiSpeedProfile")
+        }
+    }
     @Published var codexStatus: CodexEnvironmentStatus = CodexEnvironmentStatus(
         isLoggedIn: true,
         activeProviderLabel: "Cursor 已连接",
@@ -772,7 +779,8 @@ final class AppViewModel: ObservableObject {
                     let plan = try await CodexCLIBridge.analyze(
                         userText: cleanText,
                         imagePath: nil,
-                        preferredMode: aiProviderMode
+                        preferredMode: aiProviderMode,
+                        speedProfile: aiSpeedProfile
                     )
                     let record = HistoryRecord(
                         createdAt: Date(),
@@ -841,7 +849,8 @@ final class AppViewModel: ObservableObject {
             let plan = try await CodexCLIBridge.analyze(
                 userText: trimmed,
                 imagePath: submittedImage,
-                preferredMode: aiProviderMode
+                preferredMode: aiProviderMode,
+                speedProfile: aiSpeedProfile
             )
             let persistedImg = historyStore.persistScreenshotIfNeeded(tempPath: submittedImage)
             let record = HistoryRecord(

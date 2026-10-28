@@ -10,6 +10,30 @@ public enum AIProviderMode: String, CaseIterable, Identifiable, Sendable {
     public var id: String { rawValue }
 }
 
+public enum AISpeedProfile: String, CaseIterable, Identifiable, Sendable {
+    case flash = "极速无思考（推荐）"
+    case balanced = "均衡低思考"
+    case deep = "深度高思考"
+
+    public var id: String { rawValue }
+
+    public var cursorModelSlug: String {
+        switch self {
+        case .flash: return "gpt-5.4-nano-none"
+        case .balanced: return "gpt-5.6-sol-none-fast"
+        case .deep: return "gpt-5.6-sol-high-fast"
+        }
+    }
+
+    public var codexReasoningEffort: String {
+        switch self {
+        case .flash: return "minimal"
+        case .balanced: return "low"
+        case .deep: return "medium"
+        }
+    }
+}
+
 public struct CodexEnvironmentStatus: Sendable, Equatable {
     public var codexBinaryPath: String?
     public var cursorBinaryPath: String?
@@ -250,7 +274,12 @@ public enum CodexCLIBridge {
         }
     }
 
-    public static func analyze(userText: String, imagePath: String?, preferredMode: AIProviderMode = .auto) async throws -> ParsedPlan {
+    public static func analyze(
+        userText: String,
+        imagePath: String?,
+        preferredMode: AIProviderMode = .auto,
+        speedProfile: AISpeedProfile = .flash
+    ) async throws -> ParsedPlan {
         try await Task.detached(priority: .userInitiated) {
             // Create an isolated empty working directory so neither cursor-agent nor codex ever scans `/` (Finder launch cwd)!
             let tempDir = FileManager.default.temporaryDirectory.appendingPathComponent("MemoPilot-\(UUID().uuidString)")
@@ -285,12 +314,13 @@ public enum CodexCLIBridge {
                             "--api-key", cursorKey,
                             "--trust",
                             "--workspace", tempDir.path,
+                            "--model", speedProfile.cursorModelSlug,
                             "-p",
                             "--mode", "ask",
                             fullPrompt
                         ],
                         workingDirectoryURL: tempDir,
-                        timeout: 60.0
+                        timeout: 45.0
                     )
                     return try ParsedPlan.decode(from: output)
                 } catch {
@@ -335,13 +365,13 @@ public enum CodexCLIBridge {
                 + "\n\n注意：请直接生成最终 JSON，绝不要调用任何 shell 命令或外部工具。"
 
             // Strip all heavy desktop MCP servers (e.g. node_repl 120s timeout), plugins, shell snapshots,
-            // and force low reasoning effort + system proxy support for 2-5s response latency.
+            // and use minimal/low reasoning effort + system proxy support for fast response latency.
             var args: [String] = [
                 "exec",
                 "--ignore-user-config",
                 "--ephemeral",
                 "-C", tempDir.path,
-                "-c", "model_reasoning_effort=\"low\"",
+                "-c", "model_reasoning_effort=\"\(speedProfile.codexReasoningEffort)\"",
                 "--enable", "respect_system_proxy",
                 "--disable", "shell_tool",
                 "--disable", "shell_snapshot",
