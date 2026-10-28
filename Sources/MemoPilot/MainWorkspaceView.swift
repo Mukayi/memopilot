@@ -13,12 +13,89 @@ enum HistoryFilter: String, CaseIterable, Identifiable {
 }
 
 /// Custom ButtonStyle that ensures the entire rectangular bounds of the button label
-/// (including Spacer, secondary lines, and padding) are hit-testable on macOS.
+/// (including Spacer, secondary lines, and padding) are hit-testable on macOS,
+/// with smooth subtle hover highlight and press feedback.
 struct FullHitAreaButtonStyle: ButtonStyle {
+    var cornerRadius: CGFloat = 6
+    var hoverOpacity: Double = 0.07
+
     func makeBody(configuration: Configuration) -> some View {
-        configuration.label
-            .contentShape(Rectangle())
-            .opacity(configuration.isPressed ? 0.80 : 1.0)
+        HoverButtonBody(
+            configuration: configuration,
+            cornerRadius: cornerRadius,
+            hoverOpacity: hoverOpacity
+        )
+    }
+
+    private struct HoverButtonBody: View {
+        let configuration: Configuration
+        let cornerRadius: CGFloat
+        let hoverOpacity: Double
+        @State private var isHovered: Bool = false
+
+        var body: some View {
+            configuration.label
+                .overlay(
+                    RoundedRectangle(cornerRadius: cornerRadius, style: .continuous)
+                        .fill(Color.primary.opacity(isHovered ? hoverOpacity : 0))
+                        .allowsHitTesting(false)
+                )
+                .brightness(isHovered ? 0.03 : 0)
+                .contentShape(Rectangle())
+                .scaleEffect(configuration.isPressed ? 0.975 : 1.0)
+                .opacity(configuration.isPressed ? 0.80 : 1.0)
+                .animation(.easeOut(duration: 0.12), value: isHovered)
+                .animation(.easeOut(duration: 0.08), value: configuration.isPressed)
+                .onHover { hovering in
+                    isHovered = hovering
+                }
+        }
+    }
+}
+
+/// Reusable ViewModifier for non-Button interactive elements (Menu labels, filter tabs, section headers, pills).
+struct HoverHighlightModifier: ViewModifier {
+    var cornerRadius: CGFloat = 6
+    var hoverOpacity: Double = 0.065
+    var tint: Color = .primary
+    var isSuppressed: Bool = false
+    @State private var isHovered: Bool = false
+
+    func body(content: Content) -> some View {
+        content
+            .background(
+                RoundedRectangle(cornerRadius: cornerRadius, style: .continuous)
+                    .fill(tint.opacity((isHovered && !isSuppressed) ? hoverOpacity : 0))
+                    .allowsHitTesting(false)
+            )
+            .overlay(
+                RoundedRectangle(cornerRadius: cornerRadius, style: .continuous)
+                    .strokeBorder(tint.opacity((isHovered && !isSuppressed) ? (hoverOpacity * 1.15) : 0), lineWidth: 0.8)
+                    .allowsHitTesting(false)
+            )
+            .brightness((isHovered && !isSuppressed) ? 0.02 : 0)
+            .animation(.easeOut(duration: 0.12), value: isHovered)
+            .onHover { hovering in
+                isHovered = hovering
+            }
+    }
+}
+
+extension View {
+    func hoverHighlight(
+        cornerRadius: CGFloat = 6,
+        hoverOpacity: Double = 0.065,
+        tint: Color = .primary,
+        isSuppressed: Bool = false
+    ) -> some View {
+        modifier(
+            HoverHighlightModifier(
+                cornerRadius: cornerRadius,
+                hoverOpacity: hoverOpacity,
+                tint: tint,
+                isSuppressed: isSuppressed
+            )
+        )
     }
 }
 
@@ -128,6 +205,8 @@ struct MainWorkspaceView: View {
     @FocusState private var isSearchFocused: Bool
     @State private var dragStartSidebarWidth: CGFloat?
     @State private var hoveredRecordID: UUID?
+    @State private var hoveredDraftItemID: UUID?
+    @State private var isHoveringDivider: Bool = false
 
     // Strict 3-Column Alignment Constant:
     // Col 1 (18pt checkbox) + 10pt gap + Col 2 (44pt target pill) + 12pt gap = 84pt
@@ -163,9 +242,13 @@ struct MainWorkspaceView: View {
 
     private var resizableDivider: some View {
         Rectangle()
-            .fill(palette.hairline)
-            .frame(width: 1)
+            .fill(isHoveringDivider ? Color.accentColor.opacity(0.42) : palette.hairline)
+            .frame(width: isHoveringDivider ? 2 : 1)
             .contentShape(Rectangle().inset(by: -3))
+            .animation(.easeOut(duration: 0.12), value: isHoveringDivider)
+            .onHover { hovering in
+                isHoveringDivider = hovering
+            }
             .onTapGesture(count: 2) {
                 withAnimation(.spring(response: 0.26, dampingFraction: 0.86)) {
                     viewModel.isSidebarCollapsed.toggle()
@@ -226,6 +309,7 @@ struct MainWorkspaceView: View {
                                 .fill(isSelected ? palette.sidebarSelectedRow : Color.primary.opacity(0.001))
                                 .shadow(color: isSelected ? Color.black.opacity(0.04) : .clear, radius: 2, x: 0, y: 1)
                         )
+                        .hoverHighlight(cornerRadius: 5.5, hoverOpacity: 0.055, isSuppressed: isSelected)
                         .contentShape(Rectangle())
                         .onTapGesture {
                             withAnimation(.easeInOut(duration: 0.15)) {
@@ -383,6 +467,7 @@ struct MainWorkspaceView: View {
             .padding(.vertical, 4)
             .frame(maxWidth: .infinity, alignment: .leading)
             .background(Color.primary.opacity(0.001))
+            .hoverHighlight(cornerRadius: 5.5, hoverOpacity: 0.055)
             .contentShape(Rectangle())
             .onTapGesture {
                 withAnimation(.easeInOut(duration: 0.16)) {
@@ -451,14 +536,18 @@ struct MainWorkspaceView: View {
                 .fill(
                     isSelected
                         ? palette.sidebarSelectedRow
-                        : (isHovered ? palette.sidebarSelectedRow.opacity(0.45) : Color.primary.opacity(0.001))
+                        : (isHovered ? palette.sidebarSelectedRow.opacity(0.62) : Color.primary.opacity(0.001))
                 )
                 .shadow(color: isSelected ? Color.black.opacity(0.04) : .clear, radius: 2, x: 0, y: 1)
                 .overlay(
                     RoundedRectangle(cornerRadius: 8, style: .continuous)
-                        .strokeBorder(isSelected ? palette.hairline : Color.clear, lineWidth: 1)
+                        .strokeBorder(
+                            isSelected ? palette.hairline : (isHovered ? palette.hairline.opacity(0.75) : Color.clear),
+                            lineWidth: 1
+                        )
                 )
         )
+        .animation(.easeOut(duration: 0.12), value: isHovered)
         .contentShape(Rectangle())
         .onTapGesture {
             withAnimation(.easeInOut(duration: 0.15)) {
@@ -727,6 +816,7 @@ struct MainWorkspaceView: View {
             }
             .menuStyle(.borderlessButton)
             .fixedSize()
+            .hoverHighlight(cornerRadius: 12, hoverOpacity: 0.065)
             .popover(isPresented: $viewModel.isShowingShortcutSettings, arrowEdge: .bottom) {
                 ShortcutSettingsPopoverView(viewModel: viewModel)
             }
@@ -793,6 +883,7 @@ struct MainWorkspaceView: View {
         }
         .menuStyle(.borderlessButton)
         .fixedSize()
+        .hoverHighlight(cornerRadius: 12, hoverOpacity: 0.065)
         .help(viewModel.codexStatus.statusMessage)
     }
 
@@ -1055,6 +1146,7 @@ struct MainWorkspaceView: View {
                     }
                     .menuStyle(.borderlessButton)
                     .fixedSize()
+                    .hoverHighlight(cornerRadius: 6, hoverOpacity: 0.075)
 
                     // 2. More Actions Menu
                     Menu {
@@ -1092,6 +1184,7 @@ struct MainWorkspaceView: View {
                     }
                     .menuStyle(.borderlessButton)
                     .fixedSize()
+                    .hoverHighlight(cornerRadius: 6, hoverOpacity: 0.075)
 
                     // 3. Primary Commit Action
                     Button {
@@ -1222,6 +1315,7 @@ struct MainWorkspaceView: View {
     private func editableDraftRow(item: DraftItem) -> some View {
         let current = viewModel.draftItem(id: item.id, fallback: item)
         let activeTone = tone(for: current.targetKind)
+        let isRowHovered = (hoveredDraftItemID == item.id) || (viewModel.editingItemID == item.id)
         let isPopoverOpen = Binding<Bool>(
             get: { viewModel.editingItemID == item.id },
             set: { newValue in
@@ -1247,7 +1341,7 @@ struct MainWorkspaceView: View {
                         .foregroundStyle(current.isSelected ? Color.primary.opacity(0.75) : Color.secondary.opacity(0.32))
                         .frame(width: 18, height: 20)
                 }
-                .buttonStyle(FullHitAreaButtonStyle())
+                .buttonStyle(FullHitAreaButtonStyle(cornerRadius: 9, hoverOpacity: 0.08))
                 .padding(.trailing, 10)
             }
 
@@ -1260,6 +1354,7 @@ struct MainWorkspaceView: View {
                     RoundedRectangle(cornerRadius: 4.5, style: .continuous)
                         .fill(activeTone.opacity(0.11))
                 )
+                .hoverHighlight(cornerRadius: 4.5, hoverOpacity: 0.12, tint: activeTone)
                 .contentShape(Rectangle())
                 .onTapGesture {
                     isPopoverOpen.wrappedValue.toggle()
@@ -1303,7 +1398,7 @@ struct MainWorkspaceView: View {
                                     .fill(palette.committedTone.opacity(0.11))
                             )
                         }
-                        .buttonStyle(FullHitAreaButtonStyle())
+                        .buttonStyle(FullHitAreaButtonStyle(cornerRadius: 4, hoverOpacity: 0.08))
                         .fixedSize()
                         .help("在「\(current.targetKind.systemAppName)」中打开并定位到此项")
                     }
@@ -1313,11 +1408,15 @@ struct MainWorkspaceView: View {
                     } label: {
                         Image(systemName: current.isCommitted ? "trash" : "xmark")
                             .font(.system(size: 9.5, weight: .medium))
-                            .foregroundStyle(current.isCommitted ? palette.urgentTone.opacity(0.85) : Color.secondary.opacity(0.45))
-                            .frame(width: 19, height: 19)
+                            .foregroundStyle(
+                                current.isCommitted
+                                    ? palette.urgentTone.opacity(isRowHovered ? 0.95 : 0.72)
+                                    : Color.secondary.opacity(isRowHovered ? 0.78 : 0.40)
+                            )
+                            .frame(width: 21, height: 21)
                             .background(Color.primary.opacity(0.001))
                     }
-                    .buttonStyle(FullHitAreaButtonStyle())
+                    .buttonStyle(FullHitAreaButtonStyle(cornerRadius: 5, hoverOpacity: 0.085))
                     .fixedSize()
                     .help(current.isCommitted ? "一键从系统「\(current.targetKind.systemAppName)」中删除此项" : "删除此条草稿")
                 }
@@ -1349,7 +1448,21 @@ struct MainWorkspaceView: View {
             }
         }
         .padding(.vertical, 10.5)
-        .opacity(current.isCommitted ? 0.78 : (current.isSelected ? 1.0 : 0.45))
+        .background(
+            RoundedRectangle(cornerRadius: 7.5, style: .continuous)
+                .fill(Color.primary.opacity(isRowHovered ? 0.036 : 0))
+                .padding(.horizontal, -8)
+                .allowsHitTesting(false)
+        )
+        .animation(.easeOut(duration: 0.12), value: isRowHovered)
+        .opacity(current.isCommitted ? 0.80 : (current.isSelected ? 1.0 : 0.45))
+        .onHover { hovering in
+            if hovering {
+                hoveredDraftItemID = item.id
+            } else if hoveredDraftItemID == item.id {
+                hoveredDraftItemID = nil
+            }
+        }
         .popover(isPresented: isPopoverOpen, arrowEdge: .trailing) {
             draftEditorPopover(item: current)
         }
