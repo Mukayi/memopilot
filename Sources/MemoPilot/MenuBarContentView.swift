@@ -53,7 +53,30 @@ struct MenuBarContentView: View {
             Spacer()
 
             Button {
-                if let keyWin = NSApp.keyWindow, keyWin !== AppDelegate.mainWindow {
+                if let keyWin = NSApp.keyWindow, keyWin !== AppDelegate.mainWindow && keyWin !== AppDelegate.paperDigestWindow {
+                    keyWin.orderOut(nil)
+                }
+                AppDelegate.openPaperDigestWindow()
+            } label: {
+                HStack(spacing: 3) {
+                    Image(systemName: "doc.text.magnifyingglass")
+                        .font(.system(size: 9.5, weight: .semibold))
+                    Text("论文解析")
+                        .font(.system(size: 10.5, weight: .medium))
+                }
+                .foregroundStyle(.secondary)
+                .padding(.horizontal, 8)
+                .frame(height: 22)
+                .background(
+                    Capsule()
+                        .fill(Color.white)
+                        .overlay(Capsule().strokeBorder(Color.black.opacity(0.07), lineWidth: 1))
+                )
+            }
+            .buttonStyle(FullHitAreaButtonStyle())
+
+            Button {
+                if let keyWin = NSApp.keyWindow, keyWin !== AppDelegate.mainWindow && keyWin !== AppDelegate.paperDigestWindow {
                     keyWin.orderOut(nil)
                 }
                 AppDelegate.bringMainWindowToFront()

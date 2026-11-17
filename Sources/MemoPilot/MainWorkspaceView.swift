@@ -217,24 +217,34 @@ struct MainWorkspaceView: View {
     }
 
     var body: some View {
-        HStack(alignment: .top, spacing: 0) {
-            if !viewModel.isSidebarCollapsed {
-                sidebarColumn
-                    .frame(width: viewModel.sidebarWidth)
-                    .frame(maxHeight: .infinity, alignment: .top)
-                    .background(palette.sidebarBg)
-                    .transition(.move(edge: .leading).combined(with: .opacity))
+        Group {
+            if viewModel.workspaceMode == .paperDigest {
+                PaperDigestWorkspaceView(
+                    appViewModel: viewModel,
+                    paperVM: viewModel.paperViewModel,
+                    isStandaloneWindow: false
+                )
+            } else {
+                HStack(alignment: .top, spacing: 0) {
+                    if !viewModel.isSidebarCollapsed {
+                        sidebarColumn
+                            .frame(width: viewModel.sidebarWidth)
+                            .frame(maxHeight: .infinity, alignment: .top)
+                            .background(palette.sidebarBg)
+                            .transition(.move(edge: .leading).combined(with: .opacity))
 
-                resizableDivider
+                        resizableDivider
+                    }
+
+                    mainDetailColumn
+                        .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
+                        .background(palette.mainCanvasBg)
+                }
+                .ignoresSafeArea(.all, edges: .top)
+                .frame(minWidth: 920, minHeight: 560, alignment: .topLeading)
+                .environment(\.colorScheme, viewModel.theme.isDark ? .dark : .light)
             }
-
-            mainDetailColumn
-                .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
-                .background(palette.mainCanvasBg)
         }
-        .ignoresSafeArea(.all, edges: .top)
-        .frame(minWidth: 920, minHeight: 560, alignment: .topLeading)
-        .environment(\.colorScheme, viewModel.theme.isDark ? .dark : .light)
         .onAppear {
             viewModel.refreshCodexStatus()
         }
@@ -659,14 +669,7 @@ struct MainWorkspaceView: View {
                     .opacity(0.5)
             }
 
-            HStack(spacing: 5) {
-                Image(systemName: "sparkles")
-                    .font(.system(size: 11, weight: .semibold))
-                    .foregroundStyle(.secondary)
-                Text("MemoPilot")
-                    .font(.system(size: 13, weight: .semibold, design: .rounded))
-                    .foregroundStyle(.primary)
-            }
+            WorkspaceModeSwitcherBar(appViewModel: viewModel, palette: palette)
 
             Spacer()
 

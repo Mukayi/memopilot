@@ -2,6 +2,20 @@ import SwiftUI
 import AppKit
 import MemoPilotCore
 
+public enum WorkspaceMode: String, CaseIterable, Identifiable, Sendable {
+    case memo = "备忘日程"
+    case paperDigest = "论文解析"
+
+    public var id: String { rawValue }
+
+    public var iconName: String {
+        switch self {
+        case .memo: return "sparkles"
+        case .paperDigest: return "doc.text.magnifyingglass"
+        }
+    }
+}
+
 public enum WorkspaceTheme: String, CaseIterable, Identifiable, Sendable {
     case warmPaper = "暖米护眼"
     case notesWhite = "纯净纸白"
@@ -17,6 +31,8 @@ public enum WorkspaceTheme: String, CaseIterable, Identifiable, Sendable {
 
 @MainActor
 final class AppViewModel: ObservableObject {
+    @Published var workspaceMode: WorkspaceMode = .memo
+    let paperViewModel = PaperDigestViewModel()
     @Published var isSnapshotPreview: Bool = false
     @Published var isSidebarCollapsed: Bool = false
     @Published var sidebarWidth: CGFloat = 264
@@ -534,6 +550,32 @@ final class AppViewModel: ObservableObject {
             try? await Task.sleep(nanoseconds: 180_000_000)
             AppDelegate.captureOwnWindow(to: outPath)
             CursorRemoteControl.writeResponse("✅ 已保存当前实时窗口画面至：\(outPath)")
+
+        case "switch-mode":
+            if cmd.text == "paper" {
+                workspaceMode = .paperDigest
+            } else {
+                workspaceMode = .memo
+            }
+            CursorRemoteControl.writeResponse("✅ 已切换工作台模式为：\(workspaceMode.rawValue)")
+
+        case "open-paper-window":
+            AppDelegate.openPaperDigestWindow()
+            CursorRemoteControl.writeResponse("✅ 已打开独立「论文与推送解析」窗口")
+
+        case "analyze-paper":
+            if let urlStr = cmd.text, !urlStr.isEmpty {
+                paperViewModel.urlOrTextInput = urlStr
+            }
+            await paperViewModel.runAnalysis(preferredMode: aiProviderMode, speedProfile: aiSpeedProfile)
+            let topTitle = paperViewModel.currentRecord?.digest.primaryDisplayTitle ?? "无"
+            CursorRemoteControl.writeResponse("✅ 论文解析结果：\(paperViewModel.statusBanner ?? "") | 当前标题：\(topTitle)")
+
+        case "screenshot-paper-window":
+            let outPath = cmd.text ?? "/Users/xiatianze/Desktop/MemoPilot/docs/live-paper-window.png"
+            try? await Task.sleep(nanoseconds: 220_000_000)
+            AppDelegate.capturePaperWindow(to: outPath)
+            CursorRemoteControl.writeResponse("✅ 已保存独立论文窗口画面至：\(outPath)")
 
         default:
             CursorRemoteControl.writeResponse("⚠️ 未知指令：\(cmd.action)")

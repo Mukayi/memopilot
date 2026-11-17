@@ -678,4 +678,154 @@ public final class AppleExecutors: @unchecked Sendable {
         }
         return String(data: outData, encoding: .utf8)?.trimmingCharacters(in: .whitespacesAndNewlines)
     }
+
+    // MARK: - Paper Digest Archive to Apple Notes ("MemoPilot 论文速递")
+
+    public func archivePaperDigestToAppleNotes(record: PaperDigestRecord) async throws -> String? {
+        try await Task.detached(priority: .userInitiated) {
+            try Self.createPaperDigestNoteSync(record: record)
+        }.value
+    }
+
+    @MainActor
+    public static func openAppleNote(externalID: String?) {
+        guard let externalID, !externalID.isEmpty else {
+            openSystemApp(for: .note)
+            return
+        }
+        let jxa = """
+        function run(argv) {
+            const targetID = argv[0] || "";
+            const Notes = Application("Notes");
+            Notes.activate();
+            if (targetID.length > 0) {
+                try {
+                    const matched = Notes.notes.byId(targetID);
+                    if (matched) { Notes.show(matched); return; }
+                } catch (e) {}
+            }
+        }
+        """
+        DispatchQueue.global(qos: .userInitiated).async {
+            runQuickJXA(jxa, arguments: [externalID])
+        }
+    }
+
+    private static func createPaperDigestNoteSync(record: PaperDigestRecord) throws -> String? {
+        let d = record.digest
+        let noteTitle = d.primaryDisplayTitle
+        var htmlParts: [String] = []
+        htmlParts.append("<h1>\(htmlEscape(noteTitle))</h1>")
+        if !d.paperTitleZH.isEmpty && d.paperTitleZH != noteTitle {
+            htmlParts.append("<p><strong>\(htmlEscape(d.paperTitleZH))</strong></p>")
+        }
+
+        var metaLines: [String] = []
+        if !d.authorsAndAffiliations.isEmpty { metaLines.append("<b>机构与作者：</b>\(htmlEscape(d.authorsAndAffiliations))") }
+        if !d.venueAndDate.isEmpty { metaLines.append("<b>发表状态：</b>\(htmlEscape(d.venueAndDate))") }
+        if !d.sourceAccountOrSite.isEmpty { metaLines.append("<b>来源：</b>\(htmlEscape(d.sourceAccountOrSite))") }
+        if !d.sourceURL.isEmpty { metaLines.append("<b>原推送链接：</b><a href=\"\(htmlEscape(d.sourceURL))\">\(htmlEscape(d.sourceURL))</a>") }
+        if !d.paperURL.isEmpty { metaLines.append("<b>论文链接：</b><a href=\"\(htmlEscape(d.paperURL))\">\(htmlEscape(d.paperURL))</a>") }
+        if !d.codeURL.isEmpty { metaLines.append("<b>开源代码：</b><a href=\"\(htmlEscape(d.codeURL))\">\(htmlEscape(d.codeURL))</a>") }
+        if !d.domainTags.isEmpty { metaLines.append("<b>标签：</b>\(htmlEscape(d.domainTags.joined(separator: " · ")))") }
+        if !metaLines.isEmpty {
+            htmlParts.append("<p>" + metaLines.joined(separator: "<br>") + "</p><hr>")
+        }
+
+        if !d.oneLineConclusion.isEmpty {
+            htmlParts.append("<h2>一句话结论</h2><p>\(htmlEscape(d.oneLineConclusion))</p>")
+        }
+        if !d.whyItMatters.isEmpty {
+            htmlParts.append("<h2>为什么值得读</h2><p>\(htmlEscape(d.whyItMatters))</p>")
+        }
+        if !d.problemAndBottlenecks.isEmpty || !d.scopeBoundary.isEmpty {
+            var items = d.problemAndBottlenecks.map { "<li>\(htmlEscape($0))</li>" }.joined()
+            if !d.scopeBoundary.isEmpty {
+                items += "<li><b>结论边界：</b>\(htmlEscape(d.scopeBoundary))</li>"
+            }
+            htmlParts.append("<h2>面向的问题与边界</h2><ul>\(items)</ul>")
+        }
+        if !d.methodSteps.isEmpty {
+            let items = d.methodSteps.map { "<li>\(htmlEscape($0))</li>" }.joined()
+            htmlParts.append("<h2>核心方法拆解</h2><ol>\(items)</ol>")
+        }
+        if !d.keyResults.isEmpty || !d.computeAndTradeoffs.isEmpty {
+            var items = d.keyResults.map { "<li>\(htmlEscape($0))</li>" }.joined()
+            if !d.computeAndTradeoffs.isEmpty {
+                items += "<li><b>算力与代价权衡：</b>\(htmlEscape(d.computeAndTradeoffs))</li>"
+            }
+            htmlParts.append("<h2>关键实验与代价权衡</h2><ul>\(items)</ul>")
+        }
+        if !d.limitations.isEmpty {
+            let items = d.limitations.map { "<li>\(htmlEscape($0))</li>" }.joined()
+            htmlParts.append("<h2>局限性与未来方向</h2><ul>\(items)</ul>")
+        }
+        if !record.userNotes.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+            let safeUserNote = htmlEscape(record.userNotes).replacingOccurrences(of: "\n", with: "<br>")
+            htmlParts.append("<h2>个人批注</h2><p>\(safeUserNote)</p>")
+        }
+
+        let fullHTML = htmlParts.joined(separator: "\n")
+        let folderName = "MemoPilot 论文速递"
+
+        let script = """
+        on run argv
+            set folderTitle to item 1 of argv
+            set noteTitle to item 2 of argv
+            set noteBody to item 3 of argv
+            tell application "Notes"
+                tell default account
+                    if not (exists folder folderTitle) then
+                        make new folder with properties {name:folderTitle}
+                    end if
+                    set createdNote to make new note at folder folderTitle with properties {name:noteTitle, body:noteBody}
+                    return id of createdNote
+                end tell
+            end tell
+        end run
+        """
+
+        let process = Process()
+        process.executableURL = URL(fileURLWithPath: "/usr/bin/osascript")
+        process.arguments = ["-e", script, folderName, noteTitle, fullHTML]
+        process.standardInput = FileHandle.nullDevice
+
+        let outPipe = Pipe()
+        let errPipe = Pipe()
+        process.standardOutput = outPipe
+        process.standardError = errPipe
+
+        try process.run()
+
+        let group = DispatchGroup()
+        nonisolated(unsafe) var outData = Data()
+        nonisolated(unsafe) var errData = Data()
+
+        group.enter()
+        DispatchQueue.global(qos: .userInitiated).async {
+            outData = outPipe.fileHandleForReading.readDataToEndOfFile()
+            group.leave()
+        }
+        group.enter()
+        DispatchQueue.global(qos: .userInitiated).async {
+            errData = errPipe.fileHandleForReading.readDataToEndOfFile()
+            group.leave()
+        }
+
+        if group.wait(timeout: .now() + 10.0) == .timedOut {
+            process.terminate()
+            throw NSError(domain: "MemoPilot.Notes", code: -1, userInfo: [NSLocalizedDescriptionKey: "归档至苹果备忘录超时"])
+        }
+        process.waitUntilExit()
+
+        if process.terminationStatus != 0 {
+            let errMsg = String(data: errData, encoding: .utf8)?.trimmingCharacters(in: .whitespacesAndNewlines) ?? "未知 AppleScript 错误"
+            throw NSError(
+                domain: "MemoPilot.Notes",
+                code: Int(process.terminationStatus),
+                userInfo: [NSLocalizedDescriptionKey: errMsg]
+            )
+        }
+        return String(data: outData, encoding: .utf8)?.trimmingCharacters(in: .whitespacesAndNewlines)
+    }
 }

@@ -450,7 +450,7 @@ public enum CodexCLIBridge {
     }
 
     @discardableResult
-    private static func runProcess(
+    public static func runProcess(
         _ executable: String,
         arguments: [String],
         workingDirectoryURL: URL? = nil,

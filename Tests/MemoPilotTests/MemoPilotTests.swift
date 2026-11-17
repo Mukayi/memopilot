@@ -300,4 +300,78 @@ struct MemoPilotTests {
         }
         #expect(argsWithImage.suffix(2) == ["--", "-带短横线开头的提示词"])
     }
+
+    @Test("WebArticleFetcher extracts WeChat title, account name, data-formula LaTeX, and plain-text arXiv links while stripping massive SVG paths")
+    func wechatArticleHTMLFormulaAndLinkExtraction() throws {
+        let sampleWeChatHTML = """
+        <html>
+        <head><meta property="og:title" content="视频模型被压缩器卡住？逐帧出像素"/></head>
+        <body>
+        <span id="js_name">AIRoobt</span>
+        <div id="js_content">
+          <p>论文链接：https://arxiv.org/abs/2611.17336</p>
+          <p>每帧切成 <span class="inline-equation" data-formula="1 \\times p \\times p"><svg><path d="M213 578L200...HUGE_SVG"></path></svg></span> 的小块。</p>
+          <section class="block-equation" data-formula="x_0 = f_\\theta(x_t, t)"><svg><path d="M999..."></path></svg></section>
+        </div>
+        <script>var tail = 1;</script>
+        </body>
+        </html>
+        """
+        let url = URL(string: "https://mp.weixin.qq.com/s/6Bxf7A4oPv1V-UAkHPex0Q?scene=1")!
+        let parsed = WebArticleFetcher.parseRawHTML(sampleWeChatHTML, url: url, originalURLString: url.absoluteString)
+
+        #expect(parsed.articleTitle == "视频模型被压缩器卡住？逐帧出像素")
+        #expect(parsed.siteOrAccountName == "微信公众号 · AIRoobt")
+        #expect(parsed.cleanedBodyText.contains("$1 \\times p \\times p$"))
+        #expect(parsed.cleanedBodyText.contains("$$x_0 = f_\\theta(x_t, t)$$"))
+        #expect(!parsed.cleanedBodyText.contains("HUGE_SVG"))
+        #expect(parsed.detectedExternalURLs.contains("https://arxiv.org/abs/2611.17336"))
+        #expect(parsed.detectedArxivIDs == ["2611.17336"])
+
+        // Test URL extraction with trailing Chinese punctuation
+        let messyShare = "推荐这篇好文：https://mp.weixin.qq.com/s/6Bxf7A4oPv1V-UAkHPex0Q?scene=1，快看看！"
+        #expect(WebArticleFetcher.extractPrimaryURL(from: messyShare) == "https://mp.weixin.qq.com/s/6Bxf7A4oPv1V-UAkHPex0Q?scene=1")
+    }
+
+    @Test("PaperDigest decodes partial JSON, derives arXiv PDF link, persists in PaperDigestStore, and exports Obsidian Markdown")
+    func paperDigestDecodingStoreAndMarkdownExport() throws {
+        let rawLLMJSON = """
+        好的，解析如下：
+        {
+          "paperTitleEN": "Back to Pixels: Lifting Latent Video Diffusion into Pixel Space",
+          "paperTitleZH": "回归像素：将潜空间视频扩散抬升至像素空间",
+          "shortAlias": "PixVid",
+          "paperURL": "https://arxiv.org/abs/2611.17336",
+          "codeURL": null,
+          "domainTags": ["Video Diffusion", "Pixel-Space"],
+          "oneLineConclusion": "控制延迟从 495ms 降至 34ms",
+          "methodSteps": ["像素-潜变量对齐矩阵", "干净视频直接预测"]
+        }
+        """
+        let digest = try PaperDigest.decode(from: rawLLMJSON)
+        #expect(digest.shortAlias == "PixVid")
+        #expect(digest.pdfURL == "https://arxiv.org/pdf/2611.17336")
+        #expect(digest.hasOpenSourceCode == false)
+        #expect(digest.primaryDisplayTitle.contains("PixVid"))
+
+        let tempDir = FileManager.default.temporaryDirectory.appendingPathComponent("MemoPilotPaperTest-\(UUID().uuidString)")
+        defer { try? FileManager.default.removeItem(at: tempDir) }
+
+        let store = PaperDigestStore(baseDirectoryURL: tempDir)
+        var rec = PaperDigestRecord(userNotes: "可借鉴 x_0 预测思路", digest: digest)
+        rec.isPinned = true
+        store.saveAll([rec])
+
+        let loaded = store.loadAll()
+        #expect(loaded.count == 1)
+        #expect(loaded[0].matches(query: "pixvid") == true)
+        #expect(loaded[0].matches(query: "495ms") == true)
+
+        let mdDir = tempDir.appendingPathComponent("ExportedMD", isDirectory: true)
+        let savedMDPath = try store.writeMarkdownFile(for: rec, directoryURL: mdDir)
+        let mdContent = try String(contentsOfFile: savedMDPath, encoding: .utf8)
+        #expect(mdContent.contains("paper_url: \"https://arxiv.org/abs/2611.17336\""))
+        #expect(mdContent.contains("## 个人批注与思考"))
+        #expect(mdContent.contains("可借鉴 x_0 预测思路"))
+    }
 }

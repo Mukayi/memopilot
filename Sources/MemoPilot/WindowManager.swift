@@ -20,10 +20,13 @@ final class ZeroSafeAreaHostingView<Content: View>: NSHostingView<Content> {
 
 @MainActor
 final class AppDelegate: NSObject, NSApplicationDelegate {
+    static weak var shared: AppDelegate?
     static var mainWindow: NSWindow?
+    static var paperDigestWindow: NSWindow?
     lazy var viewModel = AppViewModel()
 
     func applicationDidFinishLaunching(_ notification: Notification) {
+        Self.shared = self
         NSApp.setActivationPolicy(.regular)
 
         if let themeIdx = CommandLine.arguments.firstIndex(of: "--theme"),
@@ -138,8 +141,91 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
     static func clearAnyWindowFirstResponder() {
         mainWindow?.makeFirstResponder(nil)
-        if let keyWin = NSApp.keyWindow, keyWin !== mainWindow {
+        paperDigestWindow?.makeFirstResponder(nil)
+        if let keyWin = NSApp.keyWindow, keyWin !== mainWindow && keyWin !== paperDigestWindow {
             keyWin.makeFirstResponder(nil)
+        }
+    }
+
+    static func openPaperDigestWindow() {
+        guard let delegate = Self.shared else { return }
+        NSApp.activate()
+
+        if paperDigestWindow == nil {
+            let window = NSWindow(
+                contentRect: NSRect(x: 0, y: 0, width: 1080, height: 700),
+                styleMask: [.titled, .closable, .miniaturizable, .resizable, .fullSizeContentView],
+                backing: .buffered,
+                defer: false
+            )
+            window.title = "MemoPilot · 论文与推送解析"
+            window.isReleasedWhenClosed = false
+            window.titleVisibility = .hidden
+            window.titlebarAppearsTransparent = true
+            window.toolbar = nil
+            window.isMovableByWindowBackground = true
+            window.backgroundColor = NSColor(red: 0.988, green: 0.982, blue: 0.968, alpha: 1.0)
+            window.contentMinSize = NSSize(width: 940, height: 580)
+
+            let rootView = PaperDigestWorkspaceView(
+                appViewModel: delegate.viewModel,
+                paperVM: delegate.viewModel.paperViewModel,
+                isStandaloneWindow: true
+            )
+            let hostingView = ZeroSafeAreaHostingView(rootView: rootView)
+            hostingView.frame = window.contentView?.bounds ?? NSRect(x: 0, y: 0, width: 1080, height: 700)
+            hostingView.autoresizingMask = [.width, .height]
+            window.contentView = hostingView
+
+            if let mainFrame = mainWindow?.frame {
+                window.setFrameOrigin(NSPoint(x: mainFrame.origin.x + 42, y: mainFrame.origin.y - 36))
+            } else {
+                window.center()
+            }
+
+            paperDigestWindow = window
+            alignTrafficLights(in: window, headerHeight: 46.0)
+
+            for name in [
+                NSWindow.didResizeNotification,
+                NSWindow.didBecomeKeyNotification,
+                NSWindow.didBecomeMainNotification,
+                NSWindow.didEndLiveResizeNotification
+            ] {
+                NotificationCenter.default.addObserver(
+                    forName: name,
+                    object: window,
+                    queue: .main
+                ) { _ in
+                    MainActor.assumeIsolated {
+                        Self.alignTrafficLights(in: Self.paperDigestWindow, headerHeight: 46.0)
+                    }
+                }
+            }
+        }
+
+        if let window = paperDigestWindow {
+            if window.isMiniaturized {
+                window.deminiaturize(nil)
+            }
+            window.makeKeyAndOrderFront(nil)
+            window.orderFrontRegardless()
+            alignTrafficLights(in: window, headerHeight: 46.0)
+        }
+    }
+
+    static func capturePaperWindow(to outputPath: String) {
+        guard let window = paperDigestWindow,
+              let contentView = window.contentView else { return }
+        let targetView = contentView.superview ?? contentView
+        targetView.layoutSubtreeIfNeeded()
+        alignTrafficLights(in: window, headerHeight: 46.0)
+        let bounds = targetView.bounds
+        guard !bounds.isEmpty,
+              let rep = targetView.bitmapImageRepForCachingDisplay(in: bounds) else { return }
+        targetView.cacheDisplay(in: bounds, to: rep)
+        if let pngData = rep.representation(using: .png, properties: [:]) {
+            try? pngData.write(to: URL(fileURLWithPath: outputPath))
         }
     }
 
@@ -154,7 +240,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     static func bringMainWindowToFront() {
         NSApp.activate()
         if mainWindow == nil {
-            (NSApp.delegate as? AppDelegate)?.setupAndShowMainWindow()
+            Self.shared?.setupAndShowMainWindow()
             return
         }
         if let window = mainWindow {
@@ -223,6 +309,29 @@ struct MemoPilotApp: App {
         .menuBarExtraStyle(.window)
         .commands {
             CommandGroup(after: .sidebar) {
+                Button("切换到「备忘日程」工作台") {
+                    withAnimation(.easeInOut(duration: 0.16)) {
+                        appDelegate.viewModel.workspaceMode = .memo
+                    }
+                    AppDelegate.bringMainWindowToFront()
+                }
+                .keyboardShortcut("1", modifiers: [.command])
+
+                Button("切换到「论文解析」工作台") {
+                    withAnimation(.easeInOut(duration: 0.16)) {
+                        appDelegate.viewModel.workspaceMode = .paperDigest
+                    }
+                    AppDelegate.bringMainWindowToFront()
+                }
+                .keyboardShortcut("2", modifiers: [.command])
+
+                Button("打开独立「论文与推送解析」窗口") {
+                    AppDelegate.openPaperDigestWindow()
+                }
+                .keyboardShortcut("p", modifiers: [.command, .shift])
+
+                Divider()
+
                 Button(appDelegate.viewModel.isSidebarCollapsed ? "显示历史侧边栏" : "隐藏历史侧边栏") {
                     withAnimation(.spring(response: 0.26, dampingFraction: 0.86)) {
                         appDelegate.viewModel.isSidebarCollapsed.toggle()
