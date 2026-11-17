@@ -4,54 +4,16 @@ import MemoPilotCore
 
 @MainActor
 final class PaperDigestViewModel: ObservableObject {
-    @Published var urlOrTextInput: String = ""
     @Published var isAnalyzing: Bool = false
     @Published var isArchivingNotes: Bool = false
     @Published var statusBanner: String?
     @Published var isErrorBanner: Bool = false
 
-    @Published var isSidebarCollapsed: Bool = false
-    @Published var sidebarWidth: CGFloat = 268
-    @Published var isStarredSectionExpanded: Bool = true
-    @Published var isRecentSectionExpanded: Bool = true
-
     @Published var records: [PaperDigestRecord] = []
-    @Published var selectedRecordID: UUID?
-    @Published var searchQuery: String = "" {
-        didSet { reconcileSelection() }
-    }
-    @Published var selectedFilter: PaperDigestFilter = .all {
-        didSet { reconcileSelection() }
-    }
+    @Published var latestCreatedRecordID: UUID?
 
     private let store = PaperDigestStore.shared
     private var notesSaveDebounceTask: Task<Void, Never>?
-
-    var filteredRecords: [PaperDigestRecord] {
-        records.filter { rec in
-            let matchesFilter: Bool
-            switch selectedFilter {
-            case .all: matchesFilter = true
-            case .starred: matchesFilter = rec.isPinned
-            case .hasCode: matchesFilter = rec.digest.hasOpenSourceCode
-            case .syncedNotes: matchesFilter = rec.isArchivedToNotes
-            }
-            return matchesFilter && rec.matches(query: searchQuery)
-        }
-    }
-
-    var starredRecords: [PaperDigestRecord] {
-        filteredRecords.filter(\.isPinned)
-    }
-
-    var unstarredRecords: [PaperDigestRecord] {
-        filteredRecords.filter { !$0.isPinned }
-    }
-
-    var currentRecord: PaperDigestRecord? {
-        guard let id = selectedRecordID else { return filteredRecords.first }
-        return records.first(where: { $0.id == id })
-    }
 
     var savedExportDirectoryPath: String? {
         store.savedExportDirectoryPath
@@ -68,30 +30,38 @@ final class PaperDigestViewModel: ObservableObject {
         } else {
             self.records = loaded
         }
-        self.selectedRecordID = self.records.first?.id
+        self.latestCreatedRecordID = self.records.first?.id
     }
 
-    private func reconcileSelection() {
-        let visible = filteredRecords
-        if let currentID = selectedRecordID, visible.contains(where: { $0.id == currentID }) {
-            return
+    func filteredRecords(query: String, filter: PaperDigestFilter) -> [PaperDigestRecord] {
+        records.filter { rec in
+            let matchesFilter: Bool
+            switch filter {
+            case .all: matchesFilter = true
+            case .starred: matchesFilter = rec.isPinned
+            case .hasCode: matchesFilter = rec.digest.hasOpenSourceCode
+            case .syncedNotes: matchesFilter = rec.isArchivedToNotes
+            }
+            return matchesFilter && rec.matches(query: query)
         }
-        AppDelegate.clearAnyWindowFirstResponder()
-        selectedRecordID = visible.first?.id
     }
 
-    func selectRecord(_ id: UUID) {
-        guard selectedRecordID != id else { return }
-        AppDelegate.clearAnyWindowFirstResponder()
-        selectedRecordID = id
-        isErrorBanner = false
+    func record(id: UUID?) -> PaperDigestRecord? {
+        guard let id else { return records.first }
+        return records.first(where: { $0.id == id })
+    }
+
+    private func saveRecordsImmediately() {
+        notesSaveDebounceTask?.cancel()
+        notesSaveDebounceTask = nil
+        store.saveAll(records)
     }
 
     func toggleStar(_ id: UUID) {
         guard let idx = records.firstIndex(where: { $0.id == id }) else { return }
         records[idx].isPinned.toggle()
         records[idx].updatedAt = Date()
-        store.saveAll(records)
+        saveRecordsImmediately()
     }
 
     func updateUserNotes(id: UUID, _ newNotes: String) {
@@ -101,53 +71,52 @@ final class PaperDigestViewModel: ObservableObject {
         records[idx].updatedAt = Date()
 
         notesSaveDebounceTask?.cancel()
-        let snapshot = records
-        notesSaveDebounceTask = Task { @MainActor in
+        notesSaveDebounceTask = Task { @MainActor [weak self] in
             try? await Task.sleep(nanoseconds: 350_000_000)
-            guard !Task.isCancelled else { return }
-            store.saveAll(snapshot)
+            guard let self, !Task.isCancelled else { return }
+            self.store.saveAll(self.records)
         }
     }
 
     func deleteRecord(_ id: UUID) {
-        AppDelegate.clearAnyWindowFirstResponder()
         records.removeAll { $0.id == id }
-        store.saveAll(records)
-        if selectedRecordID == id {
-            selectedRecordID = filteredRecords.first?.id ?? records.first?.id
-        }
+        saveRecordsImmediately()
     }
 
     func clearAllRecords() {
-        AppDelegate.clearAnyWindowFirstResponder()
         records.removeAll()
-        selectedRecordID = nil
+        latestCreatedRecordID = nil
         statusBanner = nil
         isErrorBanner = false
-        store.saveAll([])
+        saveRecordsImmediately()
     }
 
     // MARK: - Analyze Link / Article
 
-    func pasteClipboardAndAnalyze(preferredMode: AIProviderMode, speedProfile: AISpeedProfile) async {
-        guard !isAnalyzing else { return }
+    @discardableResult
+    func pasteClipboardAndAnalyze(preferredMode: AIProviderMode, speedProfile: AISpeedProfile) async -> UUID? {
+        guard !isAnalyzing else { return nil }
         let rawClipboard = NSPasteboard.general.string(forType: .string)?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
         guard !rawClipboard.isEmpty else {
             isErrorBanner = true
             statusBanner = "剪贴板为空，请先复制微信公众号推送链接、arXiv 链接或文章正文"
-            return
+            return nil
         }
-        urlOrTextInput = rawClipboard
-        await runAnalysis(preferredMode: preferredMode, speedProfile: speedProfile)
+        return await runAnalysis(rawInput: rawClipboard, preferredMode: preferredMode, speedProfile: speedProfile)
     }
 
-    func runAnalysis(preferredMode: AIProviderMode, speedProfile: AISpeedProfile) async {
-        guard !isAnalyzing else { return }
-        let submitted = urlOrTextInput.trimmingCharacters(in: .whitespacesAndNewlines)
+    @discardableResult
+    func runAnalysis(
+        rawInput: String,
+        preferredMode: AIProviderMode,
+        speedProfile: AISpeedProfile
+    ) async -> UUID? {
+        guard !isAnalyzing else { return nil }
+        let submitted = rawInput.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !submitted.isEmpty else {
             isErrorBanner = true
             statusBanner = "请粘贴微信公众号文章链接、arXiv / HuggingFace / GitHub 链接，或直接粘贴正文"
-            return
+            return nil
         }
 
         withAnimation(.easeInOut(duration: 0.2)) {
@@ -175,26 +144,22 @@ final class PaperDigestViewModel: ObservableObject {
                 digest: digest
             )
 
-            AppDelegate.clearAnyWindowFirstResponder()
             withAnimation(.spring(response: 0.30, dampingFraction: 0.85)) {
-                selectedFilter = .all
-                searchQuery = ""
                 records.insert(newRecord, at: 0)
-                selectedRecordID = newRecord.id
+                latestCreatedRecordID = newRecord.id
                 isAnalyzing = false
-                if urlOrTextInput.trimmingCharacters(in: .whitespacesAndNewlines) == submitted {
-                    urlOrTextInput = ""
-                }
                 isErrorBanner = false
                 statusBanner = "✨ 解析完成：\(digest.primaryDisplayTitle)"
-                store.saveAll(records)
+                saveRecordsImmediately()
             }
+            return newRecord.id
         } catch {
             withAnimation(.easeInOut(duration: 0.2)) {
                 isAnalyzing = false
                 isErrorBanner = true
                 statusBanner = error.localizedDescription
             }
+            return nil
         }
     }
 
@@ -210,9 +175,12 @@ final class PaperDigestViewModel: ObservableObject {
 
     func archiveToAppleNotes(_ record: PaperDigestRecord) async {
         guard !isArchivingNotes else { return }
+        let wasAlreadyArchived = record.isArchivedToNotes
         isArchivingNotes = true
         isErrorBanner = false
-        statusBanner = "📒 正在归档至苹果「备忘录 > MemoPilot 论文速递」文件夹…"
+        statusBanner = wasAlreadyArchived
+            ? "📒 正在同步更新苹果「备忘录 > MemoPilot 论文速递」中的笔记…"
+            : "📒 正在归档至苹果「备忘录 > MemoPilot 论文速递」文件夹…"
         defer { isArchivingNotes = false }
 
         do {
@@ -223,10 +191,12 @@ final class PaperDigestViewModel: ObservableObject {
                     records[idx].appleNoteExternalID = extID
                 }
                 records[idx].updatedAt = Date()
-                store.saveAll(records)
+                saveRecordsImmediately()
             }
             isErrorBanner = false
-            statusBanner = "✅ 已归档至苹果「备忘录 > MemoPilot 论文速递」：\(record.digest.primaryDisplayTitle)"
+            statusBanner = wasAlreadyArchived
+                ? "✅ 已同步更新苹果「备忘录 > MemoPilot 论文速递」：\(record.digest.primaryDisplayTitle)"
+                : "✅ 已归档至苹果「备忘录 > MemoPilot 论文速递」：\(record.digest.primaryDisplayTitle)"
         } catch {
             isErrorBanner = true
             statusBanner = "归档备忘录失败：\(error.localizedDescription)"
@@ -259,7 +229,7 @@ final class PaperDigestViewModel: ObservableObject {
             if let idx = records.firstIndex(where: { $0.id == record.id }) {
                 records[idx].exportedMarkdownPath = savedFilePath
                 records[idx].updatedAt = Date()
-                store.saveAll(records)
+                saveRecordsImmediately()
             }
             isErrorBanner = false
             statusBanner = "💾 已保存 Markdown 文件：\((savedFilePath as NSString).lastPathComponent)"

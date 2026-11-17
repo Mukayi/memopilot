@@ -170,9 +170,13 @@ public enum PaperDigestAnalyzer {
             }
         }
         if digest.codeURL.isEmpty {
-            if let ghLink = fetched.detectedExternalURLs.first(where: {
+            let lowerSrc = fetched.sourceURL.lowercased()
+            if lowerSrc.contains("github.com/") && !lowerSrc.contains(".github.io") {
+                digest.codeURL = fetched.sourceURL
+            } else if let ghLink = fetched.detectedExternalURLs.first(where: {
                 let l = $0.lowercased()
-                return (l.contains("github.com/") && !l.contains(".github.io")) || l.contains("huggingface.co/")
+                let isGitHubNoise = l.contains("/login") || l.contains("/signup") || l.contains("/sponsors") || l.contains("/orgs/") || l.contains("/topics/")
+                return !isGitHubNoise && ((l.contains("github.com/") && !l.contains(".github.io")) || l.contains("huggingface.co/"))
             }) {
                 digest.codeURL = ghLink
             }

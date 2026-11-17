@@ -97,9 +97,24 @@ public final class PaperDigestStore: @unchecked Sendable {
 
     public func writeMarkdownFile(for record: PaperDigestRecord, directoryURL: URL) throws -> String {
         try FileManager.default.createDirectory(at: directoryURL, withIntermediateDirectories: true)
-        let fileURL = directoryURL.appendingPathComponent(record.suggestedMarkdownFilename())
+        let baseFilename = record.suggestedMarkdownFilename()
+        let stem = (baseFilename as NSString).deletingPathExtension
+        var candidateURL = directoryURL.appendingPathComponent(baseFilename)
+
+        // If updating the exact same record's previously exported file, overwrite in place; otherwise avoid colliding with another record's file
+        if let existingOwnPath = record.exportedMarkdownPath,
+           URL(fileURLWithPath: existingOwnPath).deletingLastPathComponent().standardizedFileURL == directoryURL.standardizedFileURL {
+            candidateURL = URL(fileURLWithPath: existingOwnPath)
+        } else {
+            var suffix = 2
+            while FileManager.default.fileExists(atPath: candidateURL.path) {
+                candidateURL = directoryURL.appendingPathComponent("\(stem)-\(suffix).md")
+                suffix += 1
+            }
+        }
+
         let mdContent = record.toMarkdown(includeFrontmatter: true)
-        try mdContent.write(to: fileURL, atomically: true, encoding: .utf8)
-        return fileURL.path
+        try mdContent.write(to: candidateURL, atomically: true, encoding: .utf8)
+        return candidateURL.path
     }
 }

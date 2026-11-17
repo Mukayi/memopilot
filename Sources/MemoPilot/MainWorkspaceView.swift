@@ -243,6 +243,14 @@ struct MainWorkspaceView: View {
                 .ignoresSafeArea(.all, edges: .top)
                 .frame(minWidth: 920, minHeight: 560, alignment: .topLeading)
                 .environment(\.colorScheme, viewModel.theme.isDark ? .dark : .light)
+                .onReceive(NotificationCenter.default.publisher(for: AppDelegate.toggleSidebarNotification)) { note in
+                    let targetWin = note.object as? NSWindow
+                    if targetWin == nil || targetWin === AppDelegate.mainWindow {
+                        withAnimation(.spring(response: 0.26, dampingFraction: 0.86)) {
+                            viewModel.isSidebarCollapsed.toggle()
+                        }
+                    }
+                }
             }
         }
         .onAppear {
@@ -273,7 +281,7 @@ struct MainWorkspaceView: View {
                         }
                         let proposed = base + value.translation.width
                         if proposed >= 180 {
-                            viewModel.sidebarWidth = min(max(proposed, 235), 350)
+                            viewModel.sidebarWidth = min(max(proposed, 235), 360)
                         }
                     }
                     .onEnded { value in
@@ -661,7 +669,7 @@ struct MainWorkspaceView: View {
     private var rightPaneHeaderBar: some View {
         HStack(alignment: .center, spacing: 10) {
             if viewModel.isSidebarCollapsed {
-                Spacer().frame(width: 66)
+                Spacer().frame(width: 52)
                 sidebarToggleButton
                 newMemoButton
                 Divider()
@@ -671,16 +679,9 @@ struct MainWorkspaceView: View {
 
             WorkspaceModeSwitcherBar(appViewModel: viewModel, palette: palette)
 
-            Spacer()
+            Spacer(minLength: 6)
 
-            Button("") {
-                isSearchFocused = true
-            }
-            .keyboardShortcut("f", modifiers: [.command])
-            .frame(width: 0, height: 0)
-            .opacity(0)
-
-            // Search Field
+            // Search Field (26pt uniform height, flexible down to 120pt on narrow windows)
             HStack(alignment: .center, spacing: 5) {
                 Image(systemName: "magnifyingglass")
                     .font(.system(size: 10.5))
@@ -700,18 +701,24 @@ struct MainWorkspaceView: View {
                     .buttonStyle(FullHitAreaButtonStyle())
                 }
             }
-            .frame(width: 175, height: 24)
             .padding(.horizontal, 8)
+            .frame(minWidth: 120, idealWidth: 170, maxWidth: 176)
+            .frame(height: 26)
             .background(
-                RoundedRectangle(cornerRadius: 6, style: .continuous)
+                RoundedRectangle(cornerRadius: 6.5, style: .continuous)
                     .fill(palette.composerWellBg)
                     .overlay(
-                        RoundedRectangle(cornerRadius: 6, style: .continuous)
+                        RoundedRectangle(cornerRadius: 6.5, style: .continuous)
                             .strokeBorder(palette.hairline, lineWidth: 1)
                     )
             )
+            .background {
+                Button("") { isSearchFocused = true }
+                    .keyboardShortcut("f", modifiers: [.command])
+                    .opacity(0)
+            }
 
-            // Unified Theme, Shortcuts & Options Menu
+            // Unified Theme, Shortcuts & Options Menu (26pt exact height, zero NSPopUpButton baseline shift)
             Menu {
                 Section("界面底色") {
                     ForEach(WorkspaceTheme.allCases) { themeOption in
@@ -808,18 +815,23 @@ struct MainWorkspaceView: View {
                     Text(viewModel.theme.rawValue)
                         .font(.system(size: 11, weight: .medium))
                         .foregroundStyle(.secondary)
+                        .lineLimit(1)
+                    Image(systemName: "chevron.down")
+                        .font(.system(size: 8, weight: .bold))
+                        .foregroundStyle(.tertiary)
                 }
-                .padding(.horizontal, 9)
-                .frame(height: 24)
+                .padding(.horizontal, 10)
+                .frame(height: 26)
                 .background(
                     Capsule()
                         .fill(palette.composerWellBg)
                         .overlay(Capsule().strokeBorder(palette.hairline, lineWidth: 1))
                 )
             }
-            .menuStyle(.borderlessButton)
+            .menuStyle(.button)
+            .buttonStyle(FullHitAreaButtonStyle(cornerRadius: 13))
+            .menuIndicator(.hidden)
             .fixedSize()
-            .hoverHighlight(cornerRadius: 12, hoverOpacity: 0.065)
             .popover(isPresented: $viewModel.isShowingShortcutSettings, arrowEdge: .bottom) {
                 ShortcutSettingsPopoverView(viewModel: viewModel)
             }
@@ -868,25 +880,30 @@ struct MainWorkspaceView: View {
                 CodexCLIBridge.openTerminalForInstallOrLogin()
             }
         } label: {
-            HStack(alignment: .center, spacing: 4) {
+            HStack(alignment: .center, spacing: 5) {
                 Circle()
                     .fill(viewModel.codexStatus.isReady ? palette.committedTone : palette.reminderTone)
                     .frame(width: 5.5, height: 5.5)
                 Text(viewModel.codexStatus.activeProviderLabel)
                     .font(.system(size: 11, weight: .medium))
                     .foregroundStyle(.secondary)
+                    .lineLimit(1)
+                Image(systemName: "chevron.down")
+                    .font(.system(size: 8, weight: .bold))
+                    .foregroundStyle(.tertiary)
             }
-            .padding(.horizontal, 9)
-            .frame(height: 24)
+            .padding(.horizontal, 10)
+            .frame(height: 26)
             .background(
                 Capsule()
                     .fill(palette.composerWellBg)
                     .overlay(Capsule().strokeBorder(palette.hairline, lineWidth: 1))
             )
         }
-        .menuStyle(.borderlessButton)
+        .menuStyle(.button)
+        .buttonStyle(FullHitAreaButtonStyle(cornerRadius: 13))
+        .menuIndicator(.hidden)
         .fixedSize()
-        .hoverHighlight(cornerRadius: 12, hoverOpacity: 0.065)
         .help(viewModel.codexStatus.statusMessage)
     }
 

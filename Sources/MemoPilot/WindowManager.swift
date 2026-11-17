@@ -20,6 +20,7 @@ final class ZeroSafeAreaHostingView<Content: View>: NSHostingView<Content> {
 
 @MainActor
 final class AppDelegate: NSObject, NSApplicationDelegate {
+    static let toggleSidebarNotification = Notification.Name("com.xiatianze.MemoPilot.ToggleActiveSidebar")
     static weak var shared: AppDelegate?
     static var mainWindow: NSWindow?
     static var paperDigestWindow: NSWindow?
@@ -84,6 +85,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             window.contentView = hostingView
             window.center()
             Self.mainWindow = window
+            Self.applyThemeToWindows(viewModel.theme)
             Self.alignTrafficLights(in: window, headerHeight: 46.0)
 
             for name in [
@@ -165,7 +167,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             window.toolbar = nil
             window.isMovableByWindowBackground = true
             window.backgroundColor = NSColor(red: 0.988, green: 0.982, blue: 0.968, alpha: 1.0)
-            window.contentMinSize = NSSize(width: 940, height: 580)
+            window.contentMinSize = NSSize(width: 920, height: 560)
 
             let rootView = PaperDigestWorkspaceView(
                 appViewModel: delegate.viewModel,
@@ -184,6 +186,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             }
 
             paperDigestWindow = window
+            applyThemeToWindows(delegate.viewModel.theme)
             alignTrafficLights(in: window, headerHeight: 46.0)
 
             for name in [
@@ -226,6 +229,25 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         targetView.cacheDisplay(in: bounds, to: rep)
         if let pngData = rep.representation(using: .png, properties: [:]) {
             try? pngData.write(to: URL(fileURLWithPath: outputPath))
+        }
+    }
+
+    static func applyThemeToWindows(_ theme: WorkspaceTheme) {
+        let bg: NSColor
+        switch theme {
+        case .warmPaper:
+            bg = NSColor(red: 0.988, green: 0.982, blue: 0.968, alpha: 1.0)
+        case .notesWhite:
+            bg = NSColor.white
+        case .mistBlue:
+            bg = NSColor(red: 0.980, green: 0.987, blue: 0.996, alpha: 1.0)
+        case .darkNight:
+            bg = NSColor(red: 0.135, green: 0.140, blue: 0.160, alpha: 1.0)
+        }
+        let appearance = NSAppearance(named: theme.isDark ? .darkAqua : .aqua)
+        for win in [mainWindow, paperDigestWindow].compactMap({ $0 }) {
+            win.backgroundColor = bg
+            win.appearance = appearance
         }
     }
 
@@ -332,10 +354,11 @@ struct MemoPilotApp: App {
 
                 Divider()
 
-                Button(appDelegate.viewModel.isSidebarCollapsed ? "显示历史侧边栏" : "隐藏历史侧边栏") {
-                    withAnimation(.spring(response: 0.26, dampingFraction: 0.86)) {
-                        appDelegate.viewModel.isSidebarCollapsed.toggle()
-                    }
+                Button("显示 / 隐藏当前窗口侧边栏") {
+                    NotificationCenter.default.post(
+                        name: AppDelegate.toggleSidebarNotification,
+                        object: NSApp.keyWindow ?? AppDelegate.mainWindow
+                    )
                 }
                 .keyboardShortcut("s", modifiers: [.command, .control])
             }

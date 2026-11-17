@@ -1,5 +1,6 @@
 import Foundation
 import WebKit
+import PDFKit
 
 public struct FetchedWebArticle: Sendable, Equatable {
     public var sourceURL: String
@@ -33,28 +34,29 @@ public enum WebArticleFetcher {
     private static let wechatDesktopUA =
         "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) MicroMessenger/6.8.0 Chrome/122.0.0.0 Safari/537.36"
 
-    /// Extracts the first valid HTTP/HTTPS URL (or converts bare `arXiv:xxxx.xxxxx` into `https://arxiv.org/abs/...`).
+    /// Extracts the first valid HTTP/HTTPS URL (unescaping `&amp;`, preserving balanced parentheses, stripping trailing CJK punctuation)
+    /// or converts bare `arXiv:xxxx.xxxxx` into `https://arxiv.org/abs/...`.
     public static func extractPrimaryURL(from rawInput: String) -> String? {
-        let trimmed = rawInput.trimmingCharacters(in: .whitespacesAndNewlines)
+        let trimmed = rawInput
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+            .replacingOccurrences(of: "&amp;", with: "&")
         guard !trimmed.isEmpty else { return nil }
 
-        // 1. Standard http/https URL (stripping trailing CJK punctuation or closing brackets)
-        if let regex = try? NSRegularExpression(pattern: #"https?://[^\s<>\"'，。！？；：（）【】《》\)\]]+"#, options: [.caseInsensitive]),
+        // 1. Standard http/https URL (allowing parentheses inside URLs, stripping unmatched trailing punctuation)
+        if let regex = try? NSRegularExpression(pattern: #"https?://[^\s<>\"'，。！？；：（）【】《》]+"#, options: [.caseInsensitive]),
            let match = regex.firstMatch(in: trimmed, range: NSRange(trimmed.startIndex..., in: trimmed)),
            let range = Range(match.range, in: trimmed) {
             var urlStr = String(trimmed[range])
-            while let last = urlStr.last, [".", ",", ";", ")", "]", ">"].contains(String(last)) {
-                urlStr.removeLast()
-            }
+            urlStr = trimUnbalancedTrailingPunctuation(urlStr)
             return urlStr
         }
 
-        // 2. Bare arXiv identifier like "arXiv:2502.12345" or "2502.12345v1"
+        // 2. Bare arXiv identifier like "arXiv:2502.12345" or "2502.12345v2"
         if let regex = try? NSRegularExpression(pattern: #"(?:arXiv:\s*)?(\d{4}\.\d{4,5}(?:v\d+)?)"#, options: [.caseInsensitive]),
            let match = regex.firstMatch(in: trimmed, range: NSRange(trimmed.startIndex..., in: trimmed)),
            match.numberOfRanges > 1,
            let idRange = Range(match.range(at: 1), in: trimmed),
-           trimmed.count < 60 {
+           trimmed.count < 64 {
             let arxivID = String(trimmed[idRange])
             return "https://arxiv.org/abs/\(arxivID)"
         }
@@ -62,17 +64,56 @@ public enum WebArticleFetcher {
         return nil
     }
 
+    private static func trimUnbalancedTrailingPunctuation(_ rawURL: String) -> String {
+        var s = rawURL
+        while let last = s.last {
+            if [".", ",", ";", "!", "?", "'", "\"", ">"].contains(String(last)) {
+                s.removeLast()
+            } else if last == ")" {
+                let openCount = s.filter { $0 == "(" }.count
+                let closeCount = s.filter { $0 == ")" }.count
+                if closeCount > openCount {
+                    s.removeLast()
+                } else {
+                    break
+                }
+            } else if last == "]" {
+                let openCount = s.filter { $0 == "[" }.count
+                let closeCount = s.filter { $0 == "]" }.count
+                if closeCount > openCount {
+                    s.removeLast()
+                } else {
+                    break
+                }
+            } else {
+                break
+            }
+        }
+        return s
+    }
+
+    private static func makeSafeURL(from rawString: String) -> URL? {
+        if let direct = URL(string: rawString) {
+            return direct
+        }
+        if let comp = URLComponents(string: rawString), let u = comp.url {
+            return u
+        }
+        let encoded = rawString.addingPercentEncoding(withAllowedCharacters: .urlFragmentAllowed.union(.urlQueryAllowed)) ?? rawString
+        return URL(string: encoded)
+    }
+
     public static func fetchAndClean(from rawInput: String) async throws -> FetchedWebArticle {
         guard let rawURLString = extractPrimaryURL(from: rawInput) else {
-            // User pasted raw article text without a URL
-            let urls = extractInterestingURLs(from: rawInput)
-            let arxivIDs = extractArxivIDs(from: rawInput)
+            let cleanRaw = sanitizeNullBytes(rawInput)
+            let urls = extractInterestingURLs(from: cleanRaw)
+            let arxivIDs = extractArxivIDs(from: cleanRaw)
             let arxivMeta = await fetchArxivMetadataIfAvailable(ids: arxivIDs)
             return FetchedWebArticle(
                 sourceURL: "",
                 siteOrAccountName: "手动粘贴文本",
                 articleTitle: "",
-                cleanedBodyText: truncatePreservingHeadAndTail(rawInput, maxChars: 28_000),
+                cleanedBodyText: truncatePreservingHeadAndTail(cleanRaw, maxChars: 28_000),
                 detectedExternalURLs: urls,
                 detectedArxivIDs: arxivIDs,
                 arxivOfficialMetadata: arxivMeta
@@ -81,15 +122,14 @@ public enum WebArticleFetcher {
 
         // Normalize direct arXiv PDF links to abstract page for rich HTML metadata fetching
         let fetchTargetURLString: String
-        if rawURLString.contains("arxiv.org/pdf/") {
-            fetchTargetURLString = rawURLString
-                .replacingOccurrences(of: "arxiv.org/pdf/", with: "arxiv.org/abs/")
-                .replacingOccurrences(of: ".pdf", with: "")
+        if rawURLString.lowercased().contains("arxiv.org/pdf/"),
+           let arxivID = extractArxivIDs(from: rawURLString).first {
+            fetchTargetURLString = "https://arxiv.org/abs/\(arxivID)"
         } else {
             fetchTargetURLString = rawURLString
         }
 
-        guard let targetURL = URL(string: fetchTargetURLString) else {
+        guard let targetURL = makeSafeURL(from: fetchTargetURLString) else {
             throw NSError(
                 domain: "MemoPilot.WebFetch",
                 code: 400,
@@ -97,36 +137,51 @@ public enum WebArticleFetcher {
             )
         }
 
-        // Tier 1: Fast HTTP fetch + specialized WeChat / HTML cleaner
-        var article = (try? await fetchViaURLSession(url: targetURL, originalURLString: rawURLString))
+        // Tier 1: Fast HTTP fetch + specialized WeChat / HTML / PDFKit cleaner
+        var tier1Error: Error?
+        var article: FetchedWebArticle?
+        do {
+            article = try await fetchViaURLSession(url: targetURL, originalURLString: rawURLString)
+        } catch {
+            tier1Error = error
+        }
 
-        // Tier 2: Headless WKWebView fallback if HTTP body was empty, JS-rendered, or hit a verification gate
+        // If Tier 1 explicitly rejected an unsupported binary media type (image/video/zip), surface immediately
+        if let nsErr = tier1Error as NSError?, nsErr.domain == "MemoPilot.UnsupportedMedia" {
+            throw nsErr
+        }
+
+        // Tier 2: Per-call Headless WKWebView fallback if HTTP body was empty, JS-rendered, or hit a verification gate
         if article == nil || (article?.cleanedBodyText.count ?? 0) < 120 || isBlockedVerificationText(article?.cleanedBodyText ?? "") {
-            if let rendered = try? await OffscreenWebExtractor.shared.extractRenderedPage(url: targetURL, originalURLString: rawURLString),
+            if let rendered = try? await OffscreenWebExtractor.extractRenderedPage(url: targetURL, originalURLString: rawURLString),
                rendered.cleanedBodyText.count > (article?.cleanedBodyText.count ?? 0) {
                 article = rendered
             }
         }
 
         var resolved = article ?? FetchedWebArticle(sourceURL: rawURLString)
+        resolved.cleanedBodyText = sanitizeNullBytes(resolved.cleanedBodyText)
 
         // Append any extra user note typed alongside the URL
-        let extraUserNote = rawInput
-            .replacingOccurrences(of: rawURLString, with: "")
-            .trimmingCharacters(in: .whitespacesAndNewlines)
+        let extraUserNote = sanitizeNullBytes(
+            rawInput
+                .replacingOccurrences(of: "&amp;", with: "&")
+                .replacingOccurrences(of: rawURLString, with: "")
+                .trimmingCharacters(in: .whitespacesAndNewlines)
+        )
         if !extraUserNote.isEmpty {
             resolved.cleanedBodyText = "【用户附言】：\(extraUserNote)\n\n" + resolved.cleanedBodyText
         }
 
         // Tier 3: Cross-enrich with official arXiv API if any arXiv ID was found
         var allArxivIDs = resolved.detectedArxivIDs
-        for id in extractArxivIDs(from: rawURLString) where !allArxivIDs.contains(id) {
+        for id in extractArxivIDs(from: resolved.sourceURL + "\n" + rawURLString) where !allArxivIDs.contains(id) {
             allArxivIDs.insert(id, at: 0)
         }
         resolved.detectedArxivIDs = allArxivIDs
 
         if !allArxivIDs.isEmpty {
-            resolved.arxivOfficialMetadata = await fetchArxivMetadataIfAvailable(ids: allArxivIDs)
+            resolved.arxivOfficialMetadata = sanitizeNullBytes(await fetchArxivMetadataIfAvailable(ids: allArxivIDs))
         }
 
         if resolved.cleanedBodyText.trimmingCharacters(in: .whitespacesAndNewlines).count < 40
@@ -142,6 +197,10 @@ public enum WebArticleFetcher {
         return resolved
     }
 
+    private static func sanitizeNullBytes(_ text: String) -> String {
+        text.replacingOccurrences(of: "\0", with: "")
+    }
+
     private static func isBlockedVerificationText(_ text: String) -> Bool {
         let markers = ["环境异常", "完成验证后即可继续访问", "去验证", "wappoc_appmsgcaptcha", "Enable JavaScript and cookies to continue"]
         return markers.contains { text.contains($0) } && text.count < 600
@@ -150,7 +209,7 @@ public enum WebArticleFetcher {
     private static func fetchViaURLSession(url: URL, originalURLString: String) async throws -> FetchedWebArticle {
         let config = URLSessionConfiguration.ephemeral
         config.timeoutIntervalForRequest = 15.0
-        config.timeoutIntervalForResource = 20.0
+        config.timeoutIntervalForResource = 22.0
         let session = URLSession(configuration: config)
 
         var req = URLRequest(url: url)
@@ -162,21 +221,67 @@ public enum WebArticleFetcher {
             throw NSError(domain: "MemoPilot.HTTP", code: http.statusCode)
         }
 
-        let html = String(data: data, encoding: .utf8)
-            ?? String(decoding: data, as: UTF8.self)
+        let finalURL = response.url ?? url
+        let resolvedSourceURL = finalURL.absoluteString.isEmpty ? originalURLString : finalURL.absoluteString
+        let mime = (response.mimeType ?? "").lowercased()
 
-        return parseRawHTML(html, url: url, originalURLString: originalURLString)
+        // 1. Direct PDF extraction via native macOS PDFKit (handles OpenReview, ACL Anthology, NeurIPS, or redirected PDFs!)
+        let isPDFMagic = data.count >= 5 && data.prefix(5).elementsEqual([0x25, 0x50, 0x44, 0x46, 0x2D]) // "%PDF-"
+        if isPDFMagic || mime == "application/pdf" {
+            guard let pdfDoc = PDFDocument(data: data) else {
+                throw NSError(
+                    domain: "MemoPilot.UnsupportedMedia",
+                    code: 415,
+                    userInfo: [NSLocalizedDescriptionKey: "无法解析该 PDF 文档内容，请尝试粘贴对应的论文主页链接。"]
+                )
+            }
+            var pageTexts: [String] = []
+            let maxPages = min(pdfDoc.pageCount, 24)
+            for i in 0..<maxPages {
+                if let pText = pdfDoc.page(at: i)?.string, !pText.isEmpty {
+                    pageTexts.append(pText)
+                }
+            }
+            let fullPDFText = sanitizeNullBytes(pageTexts.joined(separator: "\n\n"))
+            let pdfTitle = (pdfDoc.documentAttributes?[PDFDocumentAttribute.titleAttribute] as? String)?
+                .trimmingCharacters(in: .whitespacesAndNewlines) ?? finalURL.lastPathComponent
+            let urls = extractInterestingURLs(from: fullPDFText)
+            let arxivIDs = extractArxivIDs(from: fullPDFText + "\n" + resolvedSourceURL)
+            return FetchedWebArticle(
+                sourceURL: resolvedSourceURL,
+                siteOrAccountName: "\(finalURL.host ?? "PDF") · 论文 PDF",
+                articleTitle: pdfTitle,
+                cleanedBodyText: fullPDFText,
+                detectedExternalURLs: urls,
+                detectedArxivIDs: arxivIDs
+            )
+        }
+
+        // 2. Reject non-text binary media (images, videos, archives) so binary bytes never turn into UTF-8 garbage
+        if mime.hasPrefix("image/") || mime.hasPrefix("video/") || mime.hasPrefix("audio/")
+            || mime == "application/zip" || mime == "application/octet-stream" {
+            throw NSError(
+                domain: "MemoPilot.UnsupportedMedia",
+                code: 415,
+                userInfo: [NSLocalizedDescriptionKey: "该链接指向二进制媒体文件（\(mime)），请粘贴文章或论文网页链接。"]
+            )
+        }
+
+        let html = sanitizeNullBytes(
+            String(data: data, encoding: .utf8) ?? String(decoding: data, as: UTF8.self)
+        )
+        return parseRawHTML(html, url: finalURL, originalURLString: resolvedSourceURL)
     }
 
     /// Parses WeChat Official Account HTML (`mp.weixin.qq.com`) as well as general academic/blog HTML (`arxiv.org`, `huggingface.co`, `github.com`, etc.).
     public static func parseRawHTML(_ html: String, url: URL, originalURLString: String) -> FetchedWebArticle {
         let host = (url.host ?? "").lowercased()
         let isWeChat = host.contains("weixin.qq.com")
+        let isGitHub = host.contains("github.com")
 
-        // 1. Extract Title
+        // 1. Extract Title (order-independent `<meta>` support)
         let title = firstRegexCapture(#"var\s+msg_title\s*=\s*['"]([^'"]+)['"]"#, in: html)
-            ?? firstRegexCapture(#"<meta\s+property=["']og:title["']\s+content=["']([^"']+)["']"#, in: html)
-            ?? firstRegexCapture(#"<meta\s+name=["']citation_title["']\s+content=["']([^"']+)["']"#, in: html)
+            ?? extractMetaContent(keys: ["og:title", "citation_title", "twitter:title"], in: html)
             ?? firstRegexCapture(#"<title[^>]*>(.*?)</title>"#, in: html)
             ?? ""
 
@@ -192,29 +297,31 @@ public enum WebArticleFetcher {
             accountRaw = "arXiv 预印本"
         } else if host.contains("huggingface.co") {
             accountRaw = "HuggingFace Papers"
-        } else if host.contains("github.com") {
+        } else if isGitHub {
             accountRaw = "GitHub Repository"
         } else if host.contains("openreview.net") {
             accountRaw = "OpenReview"
         } else {
-            let siteMeta = firstRegexCapture(#"<meta\s+property=["']og:site_name["']\s+content=["']([^"']+)["']"#, in: html)
+            let siteMeta = extractMetaContent(keys: ["og:site_name"], in: html)
             accountRaw = decodeHTMLEntities(siteMeta ?? host).trimmingCharacters(in: .whitespacesAndNewlines)
         }
 
-        // 3. Isolate main content container (`#js_content` for WeChat, `<article>` / `<main>` if present)
+        // 3. Isolate main content container (`#js_content` for WeChat, `markdown-body` for GitHub, `<article>` / `<main>` otherwise)
         let contentHTML: String
         if isWeChat, let wxChunk = extractWeChatJSContent(from: html) {
             contentHTML = wxChunk
-        } else if let articleChunk = firstRegexCapture(#"<article[^>]*>(.*?)</article>"#, in: html) {
+        } else if isGitHub, let ghReadme = firstRegexCapture(#"<article[^>]*class=["'][^"']*markdown-body[^"']*["'][^>]*>([\s\S]*?)</article>"#, in: html) {
+            contentHTML = ghReadme
+        } else if let articleChunk = firstRegexCapture(#"<article[^>]*>([\s\S]*?)</article>"#, in: html) {
             contentHTML = articleChunk
-        } else if let mainChunk = firstRegexCapture(#"<main[^>]*>(.*?)</main>"#, in: html) {
+        } else if let mainChunk = firstRegexCapture(#"<main[^>]*>([\s\S]*?)</main>"#, in: html) {
             contentHTML = mainChunk
         } else {
             contentHTML = html
         }
 
-        // 4. Collect external links from `href="..."` before stripping tags
-        var externalURLs = extractHrefLinks(from: contentHTML)
+        // 4. Collect external links from `href="..."` (resolving relative URLs against `url`) before stripping tags
+        var externalURLs = extractHrefLinks(from: contentHTML, baseURL: url)
 
         // 5. Convert WeChat MathJax `data-formula="..."` attributes into `$formula$` BEFORE stripping massive `<svg>` vectors!
         var working = replaceWeChatFormulasWithLaTeX(in: contentHTML)
@@ -229,26 +336,27 @@ public enum WebArticleFetcher {
         working = regexReplace(#"</(?:p|div|section|h1|h2|h3|h4|h5|h6|tr|li|blockquote)>"#, in: working, with: "\n")
         working = regexReplace(#"<[^>]+>"#, in: working, with: "")
 
-        var plainText = decodeHTMLEntities(working)
-            .replacingOccurrences(of: "\u{00A0}", with: " ")
-            .replacingOccurrences(of: "\r\n", with: "\n")
+        var plainText = sanitizeNullBytes(
+            decodeHTMLEntities(working)
+                .replacingOccurrences(of: "\u{00A0}", with: " ")
+                .replacingOccurrences(of: "\r\n", with: "\n")
+        )
 
-        // Collapse excessive blank lines
         plainText = regexReplace(#"[ \t]+\n"#, in: plainText, with: "\n")
         plainText = regexReplace(#"\n{3,}"#, in: plainText, with: "\n\n")
         plainText = plainText.trimmingCharacters(in: .whitespacesAndNewlines)
 
-        // Also include og:description / citation_abstract if body was short (e.g. arXiv abstract page)
-        let citationAuthors = allRegexCaptures(#"<meta\s+name=["']citation_author["']\s+content=["']([^"']+)["']"#, in: html)
-        let ogDesc = firstRegexCapture(#"<meta\s+(?:property|name)=["'](?:og:description|description|citation_abstract)["']\s+content=["']([^"']+)["']"#, in: html)
+        // Include citation_author / abstract meta tags if present
+        let citationAuthors = extractAllMetaContents(key: "citation_author", in: html)
+        let ogDesc = extractMetaContent(keys: ["citation_abstract", "og:description", "description"], in: html)
         if !citationAuthors.isEmpty {
             plainText = "【网页元信息作者】：\(citationAuthors.joined(separator: ", "))\n" + plainText
         }
-        if let ogDesc, plainText.count < 500 {
+        if let ogDesc, plainText.count < 600 {
             plainText += "\n\n【摘要元信息】：\(decodeHTMLEntities(ogDesc))"
         }
 
-        // Merge plain-text URLs (e.g. WeChat articles cannot link external URLs in `<a>` so authors paste plain-text `https://arxiv.org/...`!)
+        // Merge plain-text URLs
         for u in extractInterestingURLs(from: plainText) where !externalURLs.contains(u) {
             externalURLs.append(u)
         }
@@ -264,6 +372,45 @@ public enum WebArticleFetcher {
             detectedArxivIDs: arxivIDs,
             arxivOfficialMetadata: ""
         )
+    }
+
+    private static func extractMetaContent(keys: [String], in html: String) -> String? {
+        guard let metaRegex = try? NSRegularExpression(pattern: #"<meta\b[^>]+>"#, options: [.caseInsensitive]) else {
+            return nil
+        }
+        let ns = html as NSString
+        let matches = metaRegex.matches(in: html, range: NSRange(location: 0, length: min(ns.length, 120_000)))
+        for key in keys {
+            let lowerKey = key.lowercased()
+            for m in matches {
+                let tag = ns.substring(with: m.range)
+                if let attrVal = firstRegexCapture(#"(?:property|name)\s*=\s*["']([^"']+)["']"#, in: tag),
+                   attrVal.lowercased() == lowerKey,
+                   let contentVal = firstRegexCapture(#"content\s*=\s*["']([^"']+)["']"#, in: tag) {
+                    return contentVal
+                }
+            }
+        }
+        return nil
+    }
+
+    private static func extractAllMetaContents(key: String, in html: String) -> [String] {
+        guard let metaRegex = try? NSRegularExpression(pattern: #"<meta\b[^>]+>"#, options: [.caseInsensitive]) else {
+            return []
+        }
+        let lowerKey = key.lowercased()
+        let ns = html as NSString
+        let matches = metaRegex.matches(in: html, range: NSRange(location: 0, length: min(ns.length, 120_000)))
+        var values: [String] = []
+        for m in matches {
+            let tag = ns.substring(with: m.range)
+            if let attrVal = firstRegexCapture(#"(?:property|name)\s*=\s*["']([^"']+)["']"#, in: tag),
+               attrVal.lowercased() == lowerKey,
+               let contentVal = firstRegexCapture(#"content\s*=\s*["']([^"']+)["']"#, in: tag) {
+                values.append(decodeHTMLEntities(contentVal))
+            }
+        }
+        return values
     }
 
     private static func extractWeChatJSContent(from html: String) -> String? {
@@ -311,10 +458,8 @@ public enum WebArticleFetcher {
         let ns = text as NSString
         var results: [String] = []
         for match in regex.matches(in: text, range: NSRange(location: 0, length: ns.length)) {
-            var u = ns.substring(with: match.range)
-            while let last = u.last, [".", ",", ";", ")", "]", "'", "\""].contains(String(last)) {
-                u.removeLast()
-            }
+            let rawU = ns.substring(with: match.range)
+            let u = trimUnbalancedTrailingPunctuation(rawU)
             let lower = u.lowercased()
             let isNoise = lower.contains("mmbiz.qpic.cn")
                 || lower.contains("res.wx.qq.com")
@@ -327,25 +472,32 @@ public enum WebArticleFetcher {
         return Array(results.prefix(24))
     }
 
-    private static func extractHrefLinks(from html: String) -> [String] {
-        let rawHrefs = allRegexCaptures(#"href=["'](https?://[^"'\s<>]+)["']"#, in: html)
+    private static func extractHrefLinks(from html: String, baseURL: URL) -> [String] {
+        let rawHrefs = allRegexCaptures(#"href=["']([^"'\s<>]+)["']"#, in: html)
         var cleaned: [String] = []
         for h in rawHrefs {
-            let u = decodeHTMLEntities(h)
-            let lower = u.lowercased()
-            if lower.contains("mmbiz.qpic.cn") || lower.contains("res.wx.qq.com") || lower.contains("javascript:") {
+            let unescaped = decodeHTMLEntities(h)
+            if unescaped.hasPrefix("#") || unescaped.lowercased().hasPrefix("javascript:") || unescaped.lowercased().hasPrefix("mailto:") {
                 continue
             }
-            if !cleaned.contains(u) {
-                cleaned.append(u)
+            guard let resolved = URL(string: unescaped, relativeTo: baseURL)?.absoluteURL.absoluteString,
+                  resolved.lowercased().hasPrefix("http") else {
+                continue
+            }
+            let lower = resolved.lowercased()
+            if lower.contains("mmbiz.qpic.cn") || lower.contains("res.wx.qq.com") {
+                continue
+            }
+            if !cleaned.contains(resolved) {
+                cleaned.append(resolved)
             }
         }
-        return Array(cleaned.prefix(24))
+        return Array(cleaned.prefix(28))
     }
 
     public static func extractArxivIDs(from text: String) -> [String] {
         guard let regex = try? NSRegularExpression(
-            pattern: #"(?:arxiv\.org/(?:abs|pdf|html)/|arXiv:\s*)(\d{4}\.\d{4,5})(?:v\d+)?"#,
+            pattern: #"(?:arxiv\.org/(?:abs|pdf|html)/|arXiv:\s*)([A-Za-z\-]+/\d{7}|\d{4}\.\d{4,5}(?:v\d+)?)"#,
             options: [.caseInsensitive]
         ) else { return [] }
         let ns = text as NSString
@@ -407,8 +559,6 @@ public enum WebArticleFetcher {
         return lines.joined(separator: "\n")
     }
 
-    /// Preserves both the beginning (paper metadata, problem, method) and the end (experiments, limitations, future work)
-    /// when an article exceeds `maxChars`.
     public static func truncatePreservingHeadAndTail(_ text: String, maxChars: Int) -> String {
         guard text.count > maxChars else { return text }
         let headCount = Int(Double(maxChars) * 0.68)
@@ -452,8 +602,38 @@ public enum WebArticleFetcher {
 
     public static func decodeHTMLEntities(_ text: String) -> String {
         var result = text
+
+        // 1. Hex numeric entities (e.g. &#x2014;)
+        if let hexRegex = try? NSRegularExpression(pattern: #"&#[xX]([0-9A-Fa-f]+);"#) {
+            let ns = result as NSString
+            let matches = hexRegex.matches(in: result, range: NSRange(location: 0, length: ns.length))
+            let mutable = NSMutableString(string: result)
+            for m in matches.reversed() {
+                let hex = ns.substring(with: m.range(at: 1))
+                if let code = UInt32(hex, radix: 16), code > 0, let scalar = UnicodeScalar(code) {
+                    mutable.replaceCharacters(in: m.range, with: String(scalar))
+                }
+            }
+            result = mutable as String
+        }
+
+        // 2. Decimal numeric entities (e.g. &#8212;)
+        if let decRegex = try? NSRegularExpression(pattern: #"&#([0-9]+);"#) {
+            let ns = result as NSString
+            let matches = decRegex.matches(in: result, range: NSRange(location: 0, length: ns.length))
+            let mutable = NSMutableString(string: result)
+            for m in matches.reversed() {
+                let dec = ns.substring(with: m.range(at: 1))
+                if let code = UInt32(dec, radix: 10), code > 0, let scalar = UnicodeScalar(code) {
+                    mutable.replaceCharacters(in: m.range, with: String(scalar))
+                }
+            }
+            result = mutable as String
+        }
+
+        // 3. Named entities (`&amp;` decoded LAST to prevent double-unescaping)
+        return result
             .replacingOccurrences(of: "&nbsp;", with: " ")
-            .replacingOccurrences(of: "&amp;", with: "&")
             .replacingOccurrences(of: "&lt;", with: "<")
             .replacingOccurrences(of: "&gt;", with: ">")
             .replacingOccurrences(of: "&quot;", with: "\"")
@@ -464,57 +644,74 @@ public enum WebArticleFetcher {
             .replacingOccurrences(of: "&times;", with: "×")
             .replacingOccurrences(of: "&le;", with: "≤")
             .replacingOccurrences(of: "&ge;", with: "≥")
-
-        // Numeric entities like &#x2014; or &#8212;
-        if let hexRegex = try? NSRegularExpression(pattern: #"&#x([0-9A-Fa-f]+);"#) {
-            let ns = result as NSString
-            let matches = hexRegex.matches(in: result, range: NSRange(location: 0, length: ns.length))
-            let mutable = NSMutableString(string: result)
-            for m in matches.reversed() {
-                let hex = ns.substring(with: m.range(at: 1))
-                if let code = UInt32(hex, radix: 16), let scalar = UnicodeScalar(code) {
-                    mutable.replaceCharacters(in: m.range, with: String(scalar))
-                }
-            }
-            result = mutable as String
-        }
-        return result
+            .replacingOccurrences(of: "&amp;", with: "&")
     }
 }
 
-// MARK: - Tier 2 Headless WKWebView Dynamic Extractor
+// MARK: - Tier 2 Per-Call Headless WKWebView Dynamic Extractor (Concurrency-Safe)
 
 @MainActor
-private final class OffscreenWebExtractor: NSObject, WKNavigationDelegate {
-    static let shared = OffscreenWebExtractor()
+private enum OffscreenWebExtractor {
+    private final class PageLoadSession: NSObject, WKNavigationDelegate {
+        var webView: WKWebView?
+        private var continuation: CheckedContinuation<Void, Never>?
+        private var timeoutTask: Task<Void, Never>?
+        private var didResume = false
 
-    private var activeWebView: WKWebView?
-    private var navContinuation: CheckedContinuation<Void, Never>?
-    private var timeoutTask: Task<Void, Never>?
+        func load(url: URL) async -> WKWebView {
+            let wv = WKWebView(frame: CGRect(x: 0, y: 0, width: 1024, height: 900))
+            wv.customUserAgent = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/18.0 Safari/605.1.15"
+            wv.navigationDelegate = self
+            self.webView = wv
 
-    func extractRenderedPage(url: URL, originalURLString: String) async throws -> FetchedWebArticle {
-        let wv = WKWebView(frame: CGRect(x: 0, y: 0, width: 1024, height: 900))
-        wv.customUserAgent = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/18.0 Safari/605.1.15"
-        wv.navigationDelegate = self
-        self.activeWebView = wv
+            await withCheckedContinuation { (cont: CheckedContinuation<Void, Never>) in
+                self.continuation = cont
+                wv.load(URLRequest(url: url))
 
-        await withCheckedContinuation { (cont: CheckedContinuation<Void, Never>) in
-            self.navContinuation = cont
-            wv.load(URLRequest(url: url))
-
-            timeoutTask = Task { @MainActor [weak self] in
-                try? await Task.sleep(nanoseconds: 6_000_000_000)
-                guard !Task.isCancelled else { return }
-                self?.finishNav()
+                timeoutTask = Task { @MainActor [weak self] in
+                    try? await Task.sleep(nanoseconds: 6_000_000_000)
+                    guard !Task.isCancelled else { return }
+                    self?.webView?.stopLoading()
+                    self?.finish()
+                }
             }
+            wv.navigationDelegate = nil
+            return wv
         }
-        wv.navigationDelegate = nil
-        try? await Task.sleep(nanoseconds: 500_000_000)
+
+        private func finish() {
+            guard !didResume else { return }
+            didResume = true
+            timeoutTask?.cancel()
+            timeoutTask = nil
+            continuation?.resume()
+            continuation = nil
+        }
+
+        func webView(_ webView: WKWebView, didFinish navigation: WKNavigation!) {
+            finish()
+        }
+
+        func webView(_ webView: WKWebView, didFail navigation: WKNavigation!, withError error: Error) {
+            if (error as NSError).code == NSURLErrorCancelled { return }
+            finish()
+        }
+
+        func webView(_ webView: WKWebView, didFailProvisionalNavigation navigation: WKNavigation!, withError error: Error) {
+            if (error as NSError).code == NSURLErrorCancelled { return }
+            finish()
+        }
+    }
+
+    static func extractRenderedPage(url: URL, originalURLString: String) async throws -> FetchedWebArticle {
+        let session = PageLoadSession()
+        let wv = await session.load(url: url)
+        try? await Task.sleep(nanoseconds: 450_000_000)
 
         let js = """
         (function() {
             const title = document.title || '';
-            const mainEl = document.querySelector('#js_content, article, main') || document.body;
+            const mainEl = document.querySelector('#js_content, article.markdown-body, article, main') || document.body;
             const text = mainEl ? mainEl.innerText : '';
             const links = Array.from(document.querySelectorAll('a[href]'))
                 .map(a => a.href)
@@ -523,44 +720,26 @@ private final class OffscreenWebExtractor: NSObject, WKNavigationDelegate {
         })()
         """
         let raw = try? await wv.evaluateJavaScript(js)
-        self.activeWebView = nil
+        let finalURL = wv.url ?? url
+        let resolvedSource = finalURL.absoluteString.isEmpty ? originalURLString : finalURL.absoluteString
 
         guard let dict = raw as? [String: Any] else {
             throw NSError(domain: "MemoPilot.WKWebView", code: -1)
         }
         let title = (dict["title"] as? String) ?? ""
-        let text = (dict["text"] as? String) ?? ""
+        let text = ((dict["text"] as? String) ?? "").replacingOccurrences(of: "\0", with: "")
         var links = (dict["links"] as? [String]) ?? []
         for u in WebArticleFetcher.extractInterestingURLs(from: text) where !links.contains(u) {
             links.append(u)
         }
 
         return FetchedWebArticle(
-            sourceURL: originalURLString,
-            siteOrAccountName: url.host ?? "网页来源",
+            sourceURL: resolvedSource,
+            siteOrAccountName: finalURL.host ?? "网页来源",
             articleTitle: title.trimmingCharacters(in: .whitespacesAndNewlines),
             cleanedBodyText: text.trimmingCharacters(in: .whitespacesAndNewlines),
             detectedExternalURLs: links,
-            detectedArxivIDs: WebArticleFetcher.extractArxivIDs(from: text + "\n" + links.joined(separator: "\n"))
+            detectedArxivIDs: WebArticleFetcher.extractArxivIDs(from: text + "\n" + links.joined(separator: "\n") + "\n" + resolvedSource)
         )
-    }
-
-    private func finishNav() {
-        timeoutTask?.cancel()
-        timeoutTask = nil
-        navContinuation?.resume()
-        navContinuation = nil
-    }
-
-    func webView(_ webView: WKWebView, didFinish navigation: WKNavigation!) {
-        finishNav()
-    }
-
-    func webView(_ webView: WKWebView, didFail navigation: WKNavigation!, withError error: Error) {
-        finishNav()
-    }
-
-    func webView(_ webView: WKWebView, didFailProvisionalNavigation navigation: WKNavigation!, withError error: Error) {
-        finishNav()
     }
 }

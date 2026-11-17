@@ -726,7 +726,9 @@ public final class AppleExecutors: @unchecked Sendable {
         if !d.sourceAccountOrSite.isEmpty { metaLines.append("<b>来源：</b>\(htmlEscape(d.sourceAccountOrSite))") }
         if !d.sourceURL.isEmpty { metaLines.append("<b>原推送链接：</b><a href=\"\(htmlEscape(d.sourceURL))\">\(htmlEscape(d.sourceURL))</a>") }
         if !d.paperURL.isEmpty { metaLines.append("<b>论文链接：</b><a href=\"\(htmlEscape(d.paperURL))\">\(htmlEscape(d.paperURL))</a>") }
+        if !d.pdfURL.isEmpty { metaLines.append("<b>PDF 直达：</b><a href=\"\(htmlEscape(d.pdfURL))\">\(htmlEscape(d.pdfURL))</a>") }
         if !d.codeURL.isEmpty { metaLines.append("<b>开源代码：</b><a href=\"\(htmlEscape(d.codeURL))\">\(htmlEscape(d.codeURL))</a>") }
+        if !d.projectURL.isEmpty { metaLines.append("<b>项目主页：</b><a href=\"\(htmlEscape(d.projectURL))\">\(htmlEscape(d.projectURL))</a>") }
         if !d.domainTags.isEmpty { metaLines.append("<b>标签：</b>\(htmlEscape(d.domainTags.joined(separator: " · ")))") }
         if !metaLines.isEmpty {
             htmlParts.append("<p>" + metaLines.joined(separator: "<br>") + "</p><hr>")
@@ -767,16 +769,25 @@ public final class AppleExecutors: @unchecked Sendable {
 
         let fullHTML = htmlParts.joined(separator: "\n")
         let folderName = "MemoPilot 论文速递"
+        let existingID = record.appleNoteExternalID ?? ""
 
         let script = """
         on run argv
             set folderTitle to item 1 of argv
             set noteTitle to item 2 of argv
             set noteBody to item 3 of argv
+            set existingNoteID to item 4 of argv
             tell application "Notes"
                 tell default account
                     if not (exists folder folderTitle) then
                         make new folder with properties {name:folderTitle}
+                    end if
+                    if existingNoteID is not "" then
+                        try
+                            set matchedNote to note id existingNoteID
+                            set body of matchedNote to noteBody
+                            return id of matchedNote
+                        end try
                     end if
                     set createdNote to make new note at folder folderTitle with properties {name:noteTitle, body:noteBody}
                     return id of createdNote
@@ -787,7 +798,7 @@ public final class AppleExecutors: @unchecked Sendable {
 
         let process = Process()
         process.executableURL = URL(fileURLWithPath: "/usr/bin/osascript")
-        process.arguments = ["-e", script, folderName, noteTitle, fullHTML]
+        process.arguments = ["-e", script, folderName, noteTitle, fullHTML, existingID]
         process.standardInput = FileHandle.nullDevice
 
         let outPipe = Pipe()

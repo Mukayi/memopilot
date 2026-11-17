@@ -373,5 +373,48 @@ struct MemoPilotTests {
         #expect(mdContent.contains("paper_url: \"https://arxiv.org/abs/2611.17336\""))
         #expect(mdContent.contains("## 个人批注与思考"))
         #expect(mdContent.contains("可借鉴 x_0 预测思路"))
+
+        // Exporting a second distinct record with the same filename stem appends `-2.md` instead of overwriting
+        let rec2 = PaperDigestRecord(createdAt: rec.createdAt, digest: digest)
+        let savedMDPath2 = try store.writeMarkdownFile(for: rec2, directoryURL: mdDir)
+        #expect(savedMDPath2 != savedMDPath)
+        #expect(savedMDPath2.hasSuffix("-2.md"))
+    }
+
+    @Test("Edge cases: &amp; query params, balanced URL parens, decimal HTML entities, arxiv/html derivation, and empty JSON rejection")
+    func paperDigestAndWebFetcherEdgeCases() throws {
+        // 1. &amp; unescaping and balanced parentheses in URLs vs outer wrapping parens
+        let ampURL = "https://mp.weixin.qq.com/s?__biz=MzA&amp;mid=123&amp;idx=1"
+        #expect(WebArticleFetcher.extractPrimaryURL(from: ampURL) == "https://mp.weixin.qq.com/s?__biz=MzA&mid=123&idx=1")
+
+        let parenInsideURL = "参考文档 https://github.com/org/repo/blob/main/RL_(GRPO).md。"
+        #expect(WebArticleFetcher.extractPrimaryURL(from: parenInsideURL) == "https://github.com/org/repo/blob/main/RL_(GRPO).md")
+
+        let outerWrappedURL = "(详见 https://arxiv.org/abs/2501.12948v2)"
+        #expect(WebArticleFetcher.extractPrimaryURL(from: outerWrappedURL) == "https://arxiv.org/abs/2501.12948v2")
+
+        // 2. Decimal + hex HTML entities + order-independent meta tag
+        let ghHTML = """
+        <html><head><meta content="Repo&#8212;Title &#x2014; &amp;amp;" property="og:title"/></head>
+        <body><article class="markdown-body"><p>Paper: <a href="/org/repo/blob/main/paper.pdf">PDF</a></p></article></body></html>
+        """
+        let parsedGH = WebArticleFetcher.parseRawHTML(ghHTML, url: URL(string: "https://github.com/org/repo")!, originalURLString: "https://github.com/org/repo")
+        #expect(parsedGH.articleTitle == "Repo—Title — &amp;")
+        #expect(parsedGH.detectedExternalURLs.contains("https://github.com/org/repo/blob/main/paper.pdf"))
+
+        // 3. arxiv.org/html/2501.12948v2#S1 derives clean PDF URL without #S1 fragment and deduplicates tags
+        let htmlDigest = PaperDigest(
+            paperTitleEN: "Test Paper",
+            paperURL: "https://arxiv.org/html/2501.12948v2#S1",
+            domainTags: ["Diffusion", "diffusion", "RL"],
+            oneLineConclusion: "Valid conclusion"
+        )
+        #expect(htmlDigest.pdfURL == "https://arxiv.org/pdf/2501.12948v2")
+        #expect(htmlDigest.domainTags.count == 2)
+
+        // 4. Empty or diagnostic error JSON must throw so .auto mode falls back cleanly
+        #expect(throws: Error.self) {
+            _ = try PaperDigest.decode(from: "{\"error\": \"rate_limit\"}")
+        }
     }
 }

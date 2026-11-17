@@ -148,13 +148,29 @@ public struct PaperDigest: Codable, Equatable, Sendable {
     }
 
     public mutating func normalizeDerivedLinks() {
-        // Auto-derive arXiv PDF URL from abs URL or vice versa
-        if pdfURL.isEmpty, paperURL.contains("arxiv.org/abs/") {
-            pdfURL = paperURL.replacingOccurrences(of: "arxiv.org/abs/", with: "arxiv.org/pdf/")
-        } else if paperURL.isEmpty, pdfURL.contains("arxiv.org/pdf/") {
-            paperURL = pdfURL
-                .replacingOccurrences(of: "arxiv.org/pdf/", with: "arxiv.org/abs/")
-                .replacingOccurrences(of: ".pdf", with: "")
+        // Deduplicate domain tags while preserving order
+        var seenTags = Set<String>()
+        domainTags = domainTags.filter { tag in
+            let key = tag.lowercased()
+            if seenTags.contains(key) { return false }
+            seenTags.insert(key)
+            return true
+        }
+
+        // Extract arXiv ID from paperURL or pdfURL (handles /abs/, /pdf/, /html/ and strips #fragment or ?query)
+        let combinedArxivSource = !paperURL.isEmpty ? paperURL : pdfURL
+        if combinedArxivSource.lowercased().contains("arxiv.org/"),
+           let regex = try? NSRegularExpression(pattern: #"arxiv\.org/(?:abs|pdf|html)/([A-Za-z\-]+/\d{7}|\d{4}\.\d{4,5}(?:v\d+)?)"#, options: [.caseInsensitive]),
+           let match = regex.firstMatch(in: combinedArxivSource, range: NSRange(combinedArxivSource.startIndex..., in: combinedArxivSource)),
+           match.numberOfRanges > 1,
+           let idRange = Range(match.range(at: 1), in: combinedArxivSource) {
+            let arxivID = String(combinedArxivSource[idRange])
+            if paperURL.isEmpty || paperURL.lowercased().contains("arxiv.org/pdf/") {
+                paperURL = "https://arxiv.org/abs/\(arxivID)"
+            }
+            if pdfURL.isEmpty {
+                pdfURL = "https://arxiv.org/pdf/\(arxivID)"
+            }
         }
     }
 
@@ -174,8 +190,52 @@ public struct PaperDigest: Codable, Equatable, Sendable {
         !codeURL.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
     }
 
+    public static func extractPaperJSONObject(from raw: String) -> String {
+        let trimmed = raw.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty else { return trimmed }
+
+        var candidates: [String] = []
+        var depth = 0
+        var inString = false
+        var isEscaped = false
+        var startIdx: String.Index?
+
+        var idx = trimmed.startIndex
+        while idx < trimmed.endIndex {
+            let ch = trimmed[idx]
+            if isEscaped {
+                isEscaped = false
+            } else if ch == "\\" && inString {
+                isEscaped = true
+            } else if ch == "\"" {
+                inString.toggle()
+            } else if !inString {
+                if ch == "{" {
+                    if depth == 0 { startIdx = idx }
+                    depth += 1
+                } else if ch == "}" && depth > 0 {
+                    depth -= 1
+                    if depth == 0, let s = startIdx {
+                        candidates.append(String(trimmed[s...idx]))
+                        startIdx = nil
+                    }
+                }
+            }
+            idx = trimmed.index(after: idx)
+        }
+
+        for candidate in candidates.reversed() {
+            if let data = candidate.data(using: .utf8),
+               let obj = (try? JSONSerialization.jsonObject(with: data)) as? [String: Any],
+               (obj["paperTitleEN"] != nil || obj["oneLineConclusion"] != nil || obj["methodSteps"] != nil) {
+                return candidate
+            }
+        }
+        return ParsedPlan.extractJSONObject(from: raw)
+    }
+
     public static func decode(from rawOutput: String) throws -> PaperDigest {
-        let jsonString = ParsedPlan.extractJSONObject(from: rawOutput)
+        let jsonString = extractPaperJSONObject(from: rawOutput)
         guard let data = jsonString.data(using: .utf8) else {
             throw NSError(
                 domain: "MemoPilot.PaperDigest",
@@ -183,7 +243,18 @@ public struct PaperDigest: Codable, Equatable, Sendable {
                 userInfo: [NSLocalizedDescriptionKey: "无法将 AI 输出转换为 UTF-8 数据"]
             )
         }
-        return try JSONDecoder().decode(PaperDigest.self, from: data)
+        let decoded = try JSONDecoder().decode(PaperDigest.self, from: data)
+        if decoded.paperTitleEN.isEmpty
+            && decoded.paperTitleZH.isEmpty
+            && decoded.oneLineConclusion.isEmpty
+            && decoded.methodSteps.isEmpty {
+            throw NSError(
+                domain: "MemoPilot.PaperDigest",
+                code: 2,
+                userInfo: [NSLocalizedDescriptionKey: "AI 未返回有效的论文结构化字段，请重试或切换 AI 通道。"]
+            )
+        }
+        return decoded
     }
 }
 
@@ -287,6 +358,13 @@ public struct PaperDigestRecord: Codable, Identifiable, Equatable, Sendable {
         return "\(datePrefix)-\(truncated.isEmpty ? "论文解析" : truncated).md"
     }
 
+    private static func escapeYAML(_ text: String) -> String {
+        text
+            .replacingOccurrences(of: "\\", with: "\\\\")
+            .replacingOccurrences(of: "\"", with: "\\\"")
+            .replacingOccurrences(of: "\n", with: " ")
+    }
+
     public func toMarkdown(includeFrontmatter: Bool = true) -> String {
         var lines: [String] = []
         let df = DateFormatter()
@@ -294,16 +372,16 @@ public struct PaperDigestRecord: Codable, Identifiable, Equatable, Sendable {
 
         if includeFrontmatter {
             lines.append("---")
-            lines.append("title: \"\(digest.primaryDisplayTitle.replacingOccurrences(of: "\"", with: "\\\""))\"")
+            lines.append("title: \"\(Self.escapeYAML(digest.primaryDisplayTitle))\"")
             if !digest.shortAlias.isEmpty {
-                lines.append("alias: \"\(digest.shortAlias.replacingOccurrences(of: "\"", with: "\\\""))\"")
+                lines.append("alias: \"\(Self.escapeYAML(digest.shortAlias))\"")
             }
             lines.append("date: \(df.string(from: createdAt))")
-            if !digest.sourceURL.isEmpty { lines.append("source_url: \"\(digest.sourceURL)\"") }
-            if !digest.paperURL.isEmpty { lines.append("paper_url: \"\(digest.paperURL)\"") }
-            if !digest.codeURL.isEmpty { lines.append("code_url: \"\(digest.codeURL)\"") }
+            if !digest.sourceURL.isEmpty { lines.append("source_url: \"\(Self.escapeYAML(digest.sourceURL))\"") }
+            if !digest.paperURL.isEmpty { lines.append("paper_url: \"\(Self.escapeYAML(digest.paperURL))\"") }
+            if !digest.codeURL.isEmpty { lines.append("code_url: \"\(Self.escapeYAML(digest.codeURL))\"") }
             if !digest.domainTags.isEmpty {
-                let tagList = digest.domainTags.map { "\"\($0)\"" }.joined(separator: ", ")
+                let tagList = digest.domainTags.map { "\"\(Self.escapeYAML($0))\"" }.joined(separator: ", ")
                 lines.append("tags: [\(tagList)]")
             }
             lines.append("---")
@@ -328,6 +406,8 @@ public struct PaperDigestRecord: Codable, Identifiable, Equatable, Sendable {
             let srcLabel = [digest.sourceAccountOrSite, digest.sourceArticleTitle]
                 .filter { !$0.isEmpty }
                 .joined(separator: "｜")
+                .replacingOccurrences(of: "[", with: "【")
+                .replacingOccurrences(of: "]", with: "】")
             if !digest.sourceURL.isEmpty {
                 lines.append("- **推送来源**：[\(srcLabel)](\(digest.sourceURL))")
             } else {

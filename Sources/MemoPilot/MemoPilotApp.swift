@@ -35,7 +35,7 @@ final class AppViewModel: ObservableObject {
     let paperViewModel = PaperDigestViewModel()
     @Published var isSnapshotPreview: Bool = false
     @Published var isSidebarCollapsed: Bool = false
-    @Published var sidebarWidth: CGFloat = 264
+    @Published var sidebarWidth: CGFloat = 268
     @Published var isPinnedSectionExpanded: Bool = true
     @Published var isTodaySectionExpanded: Bool = true
     @Published var isEarlierSectionExpanded: Bool = true
@@ -45,6 +45,7 @@ final class AppViewModel: ObservableObject {
     ) ?? .warmPaper {
         didSet {
             UserDefaults.standard.set(theme.rawValue, forKey: "MemoPilot.theme")
+            AppDelegate.applyThemeToWindows(theme)
         }
     }
 
@@ -208,14 +209,34 @@ final class AppViewModel: ObservableObject {
         }
         GlobalHotKeyService.shared.onQuickScreenshotTriggered = { [weak self] in
             Task { @MainActor in
-                await self?.captureScreenAndAnalyze()
+                guard let self else { return }
+                self.workspaceMode = .memo
+                await self.captureScreenAndAnalyze()
                 AppDelegate.bringMainWindowToFront()
             }
         }
         GlobalHotKeyService.shared.onClipboardAnalyzeTriggered = { [weak self] in
             Task { @MainActor in
-                AppDelegate.bringMainWindowToFront()
-                await self?.analyzeClipboard()
+                guard let self else { return }
+                let clipText = NSPasteboard.general.string(forType: .string)?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+                let isPaperWindowActive = (NSApp.keyWindow === AppDelegate.paperDigestWindow && AppDelegate.paperDigestWindow != nil)
+                let isInPaperModeWithURL = (self.workspaceMode == .paperDigest && WebArticleFetcher.extractPrimaryURL(from: clipText) != nil)
+
+                if isPaperWindowActive || isInPaperModeWithURL {
+                    if isPaperWindowActive {
+                        AppDelegate.openPaperDigestWindow()
+                    } else {
+                        AppDelegate.bringMainWindowToFront()
+                    }
+                    await self.paperViewModel.pasteClipboardAndAnalyze(
+                        preferredMode: self.aiProviderMode,
+                        speedProfile: self.aiSpeedProfile
+                    )
+                } else {
+                    self.workspaceMode = .memo
+                    AppDelegate.bringMainWindowToFront()
+                    await self.analyzeClipboard()
+                }
             }
         }
         GlobalHotKeyService.shared.applyConfiguration(hotKeyConfig)
@@ -263,9 +284,12 @@ final class AppViewModel: ObservableObject {
         RunLoop.main.add(notesTimer, forMode: .common)
         notesWatchTimer = notesTimer
 
-        // Intercept Cmd+V when an image (or Finder image file) is on the pasteboard
+        // Intercept Cmd+V when an image (or Finder image file) is on the pasteboard ONLY inside the Memo workspace
         pasteMonitor = NSEvent.addLocalMonitorForEvents(matching: .keyDown) { [weak self] event in
             guard let self, !self.isShowingShortcutSettings else { return event }
+            guard event.window === AppDelegate.mainWindow, self.workspaceMode == .memo else {
+                return event
+            }
             let flags = event.modifierFlags.intersection([.command, .option, .control, .shift])
             if flags == .command && event.charactersIgnoringModifiers?.lowercased() == "v" {
                 if let payload = ClipboardService.readPayload(),
@@ -349,7 +373,7 @@ final class AppViewModel: ObservableObject {
         if let currentID = selectedRecordID, visible.contains(where: { $0.id == currentID }) {
             return
         }
-        AppDelegate.clearAnyWindowFirstResponder()
+        // Do NOT call clearAnyWindowFirstResponder() here, otherwise typing in the Search TextField immediately loses focus!
         if let firstVisible = visible.first {
             selectedRecordID = firstVisible.id
             parsedPlan = firstVisible.plan
@@ -564,11 +588,13 @@ final class AppViewModel: ObservableObject {
             CursorRemoteControl.writeResponse("✅ 已打开独立「论文与推送解析」窗口")
 
         case "analyze-paper":
-            if let urlStr = cmd.text, !urlStr.isEmpty {
-                paperViewModel.urlOrTextInput = urlStr
-            }
-            await paperViewModel.runAnalysis(preferredMode: aiProviderMode, speedProfile: aiSpeedProfile)
-            let topTitle = paperViewModel.currentRecord?.digest.primaryDisplayTitle ?? "无"
+            let rawArg = cmd.text ?? ""
+            await paperViewModel.runAnalysis(
+                rawInput: rawArg,
+                preferredMode: aiProviderMode,
+                speedProfile: aiSpeedProfile
+            )
+            let topTitle = paperViewModel.records.first?.digest.primaryDisplayTitle ?? "无"
             CursorRemoteControl.writeResponse("✅ 论文解析结果：\(paperViewModel.statusBanner ?? "") | 当前标题：\(topTitle)")
 
         case "screenshot-paper-window":
