@@ -204,43 +204,52 @@ struct PaperDigestWorkspaceView: View {
     }
 
     private var resizableDivider: some View {
-        Rectangle()
-            .fill(isHoveringDivider ? Color.accentColor.opacity(0.42) : palette.hairline)
-            .frame(width: isHoveringDivider ? 2 : 1)
-            .contentShape(Rectangle().inset(by: -3))
-            .animation(.easeOut(duration: 0.12), value: isHoveringDivider)
-            .onHover { isHoveringDivider = $0 }
-            .onTapGesture(count: 2) {
-                withAnimation(.spring(response: 0.26, dampingFraction: 0.86)) {
-                    isSidebarCollapsed.toggle()
+        ZStack {
+            Rectangle()
+                .fill(isHoveringDivider ? Color.accentColor.opacity(0.45) : palette.hairline)
+                .frame(width: isHoveringDivider ? 2 : 1)
+        }
+        .frame(width: 1)
+        .overlay {
+            NativeSplitResizeHandle(
+                orientation: .verticalDivider,
+                onHoverChanged: { hovering in
+                    withAnimation(.easeOut(duration: 0.12)) {
+                        isHoveringDivider = hovering
+                    }
+                },
+                onDragChanged: { translation in
+                    let base = dragStartSidebarWidth ?? sidebarWidth
+                    if dragStartSidebarWidth == nil {
+                        dragStartSidebarWidth = base
+                    }
+                    let proposed = base + translation.width
+                    if proposed >= 180 {
+                        let clamped = min(max(proposed, 235), 315)
+                        sidebarWidth = clamped
+                        if !isStandaloneWindow {
+                            appViewModel.sidebarWidth = clamped
+                        }
+                    }
+                },
+                onDragEnded: { translation in
+                    let base = dragStartSidebarWidth ?? sidebarWidth
+                    dragStartSidebarWidth = nil
+                    if base + translation.width < 180 {
+                        withAnimation(.spring(response: 0.25, dampingFraction: 0.86)) {
+                            isSidebarCollapsed = true
+                        }
+                    }
+                },
+                onDoubleClick: {
+                    withAnimation(.spring(response: 0.26, dampingFraction: 0.86)) {
+                        isSidebarCollapsed.toggle()
+                    }
                 }
-            }
-            .gesture(
-                DragGesture(minimumDistance: 2, coordinateSpace: .global)
-                    .onChanged { value in
-                        let base = dragStartSidebarWidth ?? sidebarWidth
-                        if dragStartSidebarWidth == nil {
-                            dragStartSidebarWidth = base
-                        }
-                        let proposed = base + value.translation.width
-                        if proposed >= 180 {
-                            let clamped = min(max(proposed, 235), 315)
-                            sidebarWidth = clamped
-                            if !isStandaloneWindow {
-                                appViewModel.sidebarWidth = clamped
-                            }
-                        }
-                    }
-                    .onEnded { value in
-                        let base = dragStartSidebarWidth ?? sidebarWidth
-                        dragStartSidebarWidth = nil
-                        if base + value.translation.width < 180 {
-                            withAnimation(.spring(response: 0.25, dampingFraction: 0.86)) {
-                                isSidebarCollapsed = true
-                            }
-                        }
-                    }
             )
+            .frame(width: 8)
+        }
+        .zIndex(10)
     }
 
     // MARK: - Left Sidebar (论文速递库 — Exact 12pt Horizontal Margins)
@@ -255,6 +264,7 @@ struct PaperDigestWorkspaceView: View {
             }
             .frame(height: 46)
             .padding(.trailing, 12)
+            .windowTitlebarDragBackground()
 
             Rectangle()
                 .fill(palette.hairline)
@@ -612,11 +622,12 @@ struct PaperDigestWorkspaceView: View {
 
     private var paperMainDetailColumn: some View {
         GeometryReader { colGeo in
-            let maxAllowedThreadHeight = max(115, min(colGeo.size.height * 0.44, 380))
+            let maxAllowedThreadHeight = max(120, min(colGeo.size.height - 210, 480))
 
             VStack(alignment: .leading, spacing: 0) {
                 paperHeaderBar
                     .frame(height: 46)
+                    .windowTitlebarDragBackground()
 
                 Rectangle()
                     .fill(palette.hairline)
@@ -1643,78 +1654,90 @@ struct PaperDigestWorkspaceView: View {
         let draftBinding = discussionDraftBinding(for: record.id)
         let currentDraftText = draftBinding.wrappedValue
 
+        let makeResizeHandle = { () -> NativeSplitResizeHandle in
+            NativeSplitResizeHandle(
+                orientation: .horizontalDivider,
+                onHoverChanged: { hovering in
+                    withAnimation(.easeOut(duration: 0.12)) {
+                        isHoveringDiscussionDivider = hovering
+                    }
+                },
+                onDragChanged: { translation in
+                    if !isDiscussionExpanded {
+                        isDiscussionExpanded = true
+                    }
+                    let base = dragStartDiscussionHeight ?? (showThreadArea ? effectiveThreadHeight : 105)
+                    if dragStartDiscussionHeight == nil {
+                        dragStartDiscussionHeight = base
+                    }
+                    // Dragging UP gives negative top-down translation.height -> increases dock height
+                    let proposed = base - translation.height
+                    if proposed >= 75 {
+                        discussionThreadHeight = min(max(proposed, 105), maxThreadHeightBudget)
+                    }
+                },
+                onDragEnded: { translation in
+                    let base = dragStartDiscussionHeight ?? effectiveThreadHeight
+                    dragStartDiscussionHeight = nil
+                    if base - translation.height < 75 && !isBusy {
+                        withAnimation(.spring(response: 0.25, dampingFraction: 0.86)) {
+                            isDiscussionExpanded = false
+                        }
+                    }
+                },
+                onDoubleClick: {
+                    withAnimation(.spring(response: 0.25, dampingFraction: 0.86)) {
+                        isDiscussionExpanded.toggle()
+                    }
+                }
+            )
+        }
+
         return VStack(alignment: .leading, spacing: 0) {
-            // Draggable Horizontal Resize Handle (Double-click to toggle expand/collapse)
+            // Draggable Horizontal Resize Handle (Outside .onDrop so AppKit DropView never intercepts splitter drags!)
             ZStack {
                 Rectangle()
-                    .fill(isHoveringDiscussionDivider ? Color.accentColor.opacity(0.45) : palette.hairline)
+                    .fill(isHoveringDiscussionDivider ? Color.accentColor.opacity(0.55) : palette.hairline)
                     .frame(height: isHoveringDiscussionDivider ? 2 : 1)
 
-                if showThreadArea {
-                    Capsule()
-                        .fill(isHoveringDiscussionDivider ? Color.accentColor.opacity(0.65) : palette.hairline.opacity(0.85))
-                        .frame(width: 30, height: 3)
-                }
+                Capsule()
+                    .fill(isHoveringDiscussionDivider ? Color.accentColor.opacity(0.85) : palette.hairline.opacity(0.95))
+                    .frame(width: 36, height: 3.5)
             }
-            .frame(height: 7)
-            .contentShape(Rectangle())
-            .onHover { hovering in
-                isHoveringDiscussionDivider = hovering
-                if hovering {
-                    NSCursor.resizeUpDown.set()
-                } else {
-                    NSCursor.arrow.set()
-                }
+            .frame(maxWidth: .infinity)
+            .frame(height: 14)
+            .overlay {
+                makeResizeHandle()
+                    .frame(maxWidth: .infinity, maxHeight: .infinity)
             }
-            .onTapGesture(count: 2) {
-                withAnimation(.spring(response: 0.25, dampingFraction: 0.86)) {
-                    isDiscussionExpanded.toggle()
-                }
-            }
-            .gesture(
-                DragGesture(minimumDistance: 2, coordinateSpace: .global)
-                    .onChanged { value in
-                        if !showThreadArea {
-                            isDiscussionExpanded = true
-                        }
-                        let base = dragStartDiscussionHeight ?? effectiveThreadHeight
-                        if dragStartDiscussionHeight == nil {
-                            dragStartDiscussionHeight = base
-                        }
-                        // Dragging UP (negative translation.height) increases dock height
-                        let proposed = base - value.translation.height
-                        if proposed >= 75 {
-                            discussionThreadHeight = min(max(proposed, 105), maxThreadHeightBudget)
-                        }
-                    }
-                    .onEnded { value in
-                        let base = dragStartDiscussionHeight ?? effectiveThreadHeight
-                        dragStartDiscussionHeight = nil
-                        if base - value.translation.height < 75 && !isBusy {
-                            withAnimation(.spring(response: 0.25, dampingFraction: 0.86)) {
-                                isDiscussionExpanded = false
-                            }
-                        }
-                    }
-            )
+            .zIndex(30)
 
             VStack(alignment: .leading, spacing: 9) {
                 // Header Strip (Visible when expanded, loading PDF, or when prior messages exist)
                 if showThreadArea || hasMessages || isPDFLoading {
                     HStack(alignment: .center, spacing: 8) {
-                        Image(systemName: "bubble.left.and.bubble.right.fill")
-                            .font(.system(size: 11, weight: .semibold))
-                            .foregroundStyle(palette.calendarTone)
-                            .frame(width: 16, alignment: .center)
+                        HStack(alignment: .center, spacing: 8) {
+                            Image(systemName: "bubble.left.and.bubble.right.fill")
+                                .font(.system(size: 11, weight: .semibold))
+                                .foregroundStyle(palette.calendarTone)
+                                .frame(width: 16, alignment: .center)
 
-                        Text("继续讨论")
-                            .font(.system(size: 12.5, weight: .bold))
-                            .foregroundStyle(.primary)
+                            Text("继续讨论")
+                                .font(.system(size: 12.5, weight: .bold))
+                                .foregroundStyle(.primary)
+                                .fixedSize()
+                        }
+                        .overlay {
+                            makeResizeHandle()
+                                .frame(maxWidth: .infinity, maxHeight: .infinity)
+                        }
 
                         // Live Original PDF Grounding Status Badge / Action Pill
                         pdfGroundingStatusBadge(for: record, isPDFLoading: isPDFLoading, isPDFReady: isPDFReady)
 
-                        Spacer(minLength: 4)
+                        makeResizeHandle()
+                            .frame(maxWidth: .infinity)
+                            .frame(height: 22)
 
                         if hasMessages {
                             Button {
@@ -1810,7 +1833,7 @@ struct PaperDigestWorkspaceView: View {
                                 .frame(maxWidth: .infinity, alignment: .leading)
                                 .padding(.trailing, 4)
                             }
-                            .frame(minHeight: min(92, effectiveThreadHeight), maxHeight: effectiveThreadHeight)
+                            .frame(height: effectiveThreadHeight)
                             .onAppear {
                                 if isBusy {
                                     proxy.scrollTo("discussion-thinking-anchor", anchor: .bottom)
@@ -1964,14 +1987,14 @@ struct PaperDigestWorkspaceView: View {
                 )
             }
             .padding(.horizontal, 24)
-            .padding(.top, 6)
+            .padding(.top, 2)
             .padding(.bottom, 12)
             .background(palette.mainCanvasBg)
-        }
-        .onDrop(of: [.pdf, .fileURL], isTargeted: $isDropTargetingDiscussion) { providers in
-            handleDroppedPDFProviders(providers) { pdfURL in
-                Task { @MainActor in
-                    paperVM.attachLocalPDF(url: pdfURL, for: record.id)
+            .onDrop(of: [.pdf, .fileURL], isTargeted: $isDropTargetingDiscussion) { providers in
+                handleDroppedPDFProviders(providers) { pdfURL in
+                    Task { @MainActor in
+                        paperVM.attachLocalPDF(url: pdfURL, for: record.id)
+                    }
                 }
             }
         }

@@ -259,41 +259,48 @@ struct MainWorkspaceView: View {
     }
 
     private var resizableDivider: some View {
-        Rectangle()
-            .fill(isHoveringDivider ? Color.accentColor.opacity(0.42) : palette.hairline)
-            .frame(width: isHoveringDivider ? 2 : 1)
-            .contentShape(Rectangle().inset(by: -3))
-            .animation(.easeOut(duration: 0.12), value: isHoveringDivider)
-            .onHover { hovering in
-                isHoveringDivider = hovering
-            }
-            .onTapGesture(count: 2) {
-                withAnimation(.spring(response: 0.26, dampingFraction: 0.86)) {
-                    viewModel.isSidebarCollapsed.toggle()
+        ZStack {
+            Rectangle()
+                .fill(isHoveringDivider ? Color.accentColor.opacity(0.45) : palette.hairline)
+                .frame(width: isHoveringDivider ? 2 : 1)
+        }
+        .frame(width: 1)
+        .overlay {
+            NativeSplitResizeHandle(
+                orientation: .verticalDivider,
+                onHoverChanged: { hovering in
+                    withAnimation(.easeOut(duration: 0.12)) {
+                        isHoveringDivider = hovering
+                    }
+                },
+                onDragChanged: { translation in
+                    let base = dragStartSidebarWidth ?? viewModel.sidebarWidth
+                    if dragStartSidebarWidth == nil {
+                        dragStartSidebarWidth = base
+                    }
+                    let proposed = base + translation.width
+                    if proposed >= 180 {
+                        viewModel.sidebarWidth = min(max(proposed, 235), 360)
+                    }
+                },
+                onDragEnded: { translation in
+                    let base = dragStartSidebarWidth ?? viewModel.sidebarWidth
+                    dragStartSidebarWidth = nil
+                    if base + translation.width < 180 {
+                        withAnimation(.spring(response: 0.25, dampingFraction: 0.86)) {
+                            viewModel.isSidebarCollapsed = true
+                        }
+                    }
+                },
+                onDoubleClick: {
+                    withAnimation(.spring(response: 0.26, dampingFraction: 0.86)) {
+                        viewModel.isSidebarCollapsed.toggle()
+                    }
                 }
-            }
-            .gesture(
-                DragGesture(minimumDistance: 2, coordinateSpace: .global)
-                    .onChanged { value in
-                        let base = dragStartSidebarWidth ?? viewModel.sidebarWidth
-                        if dragStartSidebarWidth == nil {
-                            dragStartSidebarWidth = base
-                        }
-                        let proposed = base + value.translation.width
-                        if proposed >= 180 {
-                            viewModel.sidebarWidth = min(max(proposed, 235), 360)
-                        }
-                    }
-                    .onEnded { value in
-                        let base = dragStartSidebarWidth ?? viewModel.sidebarWidth
-                        dragStartSidebarWidth = nil
-                        if base + value.translation.width < 180 {
-                            withAnimation(.spring(response: 0.25, dampingFraction: 0.86)) {
-                                viewModel.isSidebarCollapsed = true
-                            }
-                        }
-                    }
             )
+            .frame(width: 8)
+        }
+        .zIndex(10)
     }
 
     // MARK: - Left Sidebar (All elements share exact 12pt horizontal margin)
@@ -308,6 +315,7 @@ struct MainWorkspaceView: View {
             }
             .frame(height: 46)
             .padding(.trailing, 12)
+            .windowTitlebarDragBackground()
 
             Rectangle()
                 .fill(palette.hairline)
@@ -636,6 +644,7 @@ struct MainWorkspaceView: View {
         VStack(alignment: .leading, spacing: 0) {
             rightPaneHeaderBar
                 .frame(height: 46)
+                .windowTitlebarDragBackground()
 
             Rectangle()
                 .fill(palette.hairline)

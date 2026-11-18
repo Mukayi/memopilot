@@ -18,6 +18,176 @@ final class ZeroSafeAreaHostingView<Content: View>: NSHostingView<Content> {
     }
 }
 
+enum SplitResizeOrientation {
+    case horizontalDivider // Resizes top/bottom panes vertically (up/down cursor)
+    case verticalDivider   // Resizes left/right panes horizontally (left/right cursor)
+
+    var cursor: NSCursor {
+        switch self {
+        case .horizontalDivider: return .resizeUpDown
+        case .verticalDivider: return .resizeLeftRight
+        }
+    }
+}
+
+final class SplitResizeNSView: NSView {
+    var orientation: SplitResizeOrientation = .horizontalDivider {
+        didSet {
+            if oldValue != orientation {
+                window?.invalidateCursorRects(for: self)
+            }
+        }
+    }
+    var onHoverChanged: ((Bool) -> Void)?
+    var onDragChanged: ((CGSize) -> Void)?
+    var onDragEnded: ((CGSize) -> Void)?
+    var onDoubleClick: (() -> Void)?
+
+    private var trackingAreaRef: NSTrackingArea?
+    private var dragStartScreenPt: NSPoint?
+    private var didBeginDrag: Bool = false
+    private var didPushDragCursor: Bool = false
+    private var lastTranslation: CGSize = .zero
+
+    override var mouseDownCanMoveWindow: Bool { false }
+
+    override func acceptsFirstMouse(for event: NSEvent?) -> Bool { true }
+
+    override func resetCursorRects() {
+        super.resetCursorRects()
+        addCursorRect(bounds, cursor: orientation.cursor)
+    }
+
+    override func updateTrackingAreas() {
+        super.updateTrackingAreas()
+        if let existing = trackingAreaRef {
+            removeTrackingArea(existing)
+        }
+        let area = NSTrackingArea(
+            rect: bounds,
+            options: [.mouseEnteredAndExited, .activeAlways, .inVisibleRect],
+            owner: self,
+            userInfo: nil
+        )
+        addTrackingArea(area)
+        trackingAreaRef = area
+    }
+
+    override func mouseEntered(with event: NSEvent) {
+        onHoverChanged?(true)
+    }
+
+    override func mouseExited(with event: NSEvent) {
+        onHoverChanged?(false)
+    }
+
+    override func mouseDown(with event: NSEvent) {
+        if event.clickCount == 2 {
+            dragStartScreenPt = nil
+            didBeginDrag = false
+            onDoubleClick?()
+            return
+        }
+        guard let win = self.window else { return }
+        dragStartScreenPt = win.convertPoint(toScreen: event.locationInWindow)
+        didBeginDrag = false
+        lastTranslation = .zero
+        if !didPushDragCursor {
+            orientation.cursor.push()
+            didPushDragCursor = true
+        }
+    }
+
+    override func mouseDragged(with event: NSEvent) {
+        guard let win = self.window, let startScreenPt = dragStartScreenPt else { return }
+        let curScreenPt = win.convertPoint(toScreen: event.locationInWindow)
+        // Convert macOS bottom-up screen Y to SwiftUI top-down translation Y
+        let translation = CGSize(
+            width: curScreenPt.x - startScreenPt.x,
+            height: startScreenPt.y - curScreenPt.y
+        )
+        if !didBeginDrag && hypot(translation.width, translation.height) >= 1.0 {
+            didBeginDrag = true
+        }
+        if didBeginDrag {
+            lastTranslation = translation
+            onDragChanged?(translation)
+        }
+    }
+
+    override func mouseUp(with event: NSEvent) {
+        if didPushDragCursor {
+            NSCursor.pop()
+            didPushDragCursor = false
+        }
+        if didBeginDrag {
+            onDragEnded?(lastTranslation)
+        }
+        dragStartScreenPt = nil
+        didBeginDrag = false
+        lastTranslation = .zero
+    }
+}
+
+struct NativeSplitResizeHandle: NSViewRepresentable {
+    var orientation: SplitResizeOrientation
+    var onHoverChanged: (Bool) -> Void
+    var onDragChanged: (CGSize) -> Void
+    var onDragEnded: (CGSize) -> Void
+    var onDoubleClick: () -> Void
+
+    func makeNSView(context: Context) -> SplitResizeNSView {
+        let v = SplitResizeNSView()
+        v.wantsLayer = true
+        v.layer?.backgroundColor = NSColor.clear.cgColor
+        v.orientation = orientation
+        v.onHoverChanged = onHoverChanged
+        v.onDragChanged = onDragChanged
+        v.onDragEnded = onDragEnded
+        v.onDoubleClick = onDoubleClick
+        return v
+    }
+
+    func updateNSView(_ nsView: SplitResizeNSView, context: Context) {
+        nsView.orientation = orientation
+        nsView.onHoverChanged = onHoverChanged
+        nsView.onDragChanged = onDragChanged
+        nsView.onDragEnded = onDragEnded
+        nsView.onDoubleClick = onDoubleClick
+    }
+
+    func sizeThatFits(_ proposal: ProposedViewSize, nsView: SplitResizeNSView, context: Context) -> CGSize {
+        let defaultW: CGFloat = (orientation == .verticalDivider) ? 8 : 32
+        let defaultH: CGFloat = (orientation == .horizontalDivider) ? 12 : 32
+        return CGSize(
+            width: proposal.width ?? defaultW,
+            height: proposal.height ?? defaultH
+        )
+    }
+}
+
+extension View {
+    /// Allows dragging the NSWindow ONLY from empty space inside the top 46pt title/header bar,
+    /// without blocking any SwiftUI buttons/menus and without making body splitters drag the window.
+    func windowTitlebarDragBackground() -> some View {
+        self.background {
+            Color.clear
+                .contentShape(Rectangle())
+                .onTapGesture(count: 2) {
+                    (NSApp.currentEvent?.window ?? NSApp.keyWindow)?.zoom(nil)
+                }
+                .gesture(
+                    DragGesture(minimumDistance: 1)
+                        .onChanged { _ in
+                            if let event = NSApp.currentEvent, event.type == .leftMouseDragged || event.type == .leftMouseDown {
+                                (event.window ?? NSApp.keyWindow)?.performDrag(with: event)
+                            }
+                        }
+                )
+        }
+    }
+}
+
 @MainActor
 final class AppDelegate: NSObject, NSApplicationDelegate {
     static let toggleSidebarNotification = Notification.Name("com.xiatianze.MemoPilot.ToggleActiveSidebar")
@@ -75,7 +245,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             window.titleVisibility = .hidden
             window.titlebarAppearsTransparent = true
             window.toolbar = nil
-            window.isMovableByWindowBackground = true
+            window.isMovableByWindowBackground = false
             window.backgroundColor = NSColor(red: 0.988, green: 0.982, blue: 0.968, alpha: 1.0)
             window.contentMinSize = NSSize(width: 920, height: 560)
 
@@ -165,7 +335,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             window.titleVisibility = .hidden
             window.titlebarAppearsTransparent = true
             window.toolbar = nil
-            window.isMovableByWindowBackground = true
+            window.isMovableByWindowBackground = false
             window.backgroundColor = NSColor(red: 0.988, green: 0.982, blue: 0.968, alpha: 1.0)
             window.contentMinSize = NSSize(width: 920, height: 560)
 
