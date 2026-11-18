@@ -74,10 +74,13 @@ struct PaperDigestWorkspaceView: View {
     @State private var isRecentSectionExpanded: Bool = true
     @State private var isShowingClearConfirmation: Bool = false
     @State private var isAuthorsExpanded: Bool = false
+    @State private var discussionInputText: String = ""
+    @State private var isDiscussionExpanded: Bool = false
 
     @FocusState private var isURLInputFocused: Bool
     @FocusState private var isSearchFocused: Bool
     @FocusState private var isNotesEditorFocused: Bool
+    @FocusState private var isDiscussionInputFocused: Bool
     @State private var dragStartSidebarWidth: CGFloat?
     @State private var isHoveringDivider: Bool = false
     @State private var hoveredRecordID: UUID?
@@ -128,6 +131,9 @@ struct PaperDigestWorkspaceView: View {
         .onAppear {
             if selectedRecordID == nil {
                 selectedRecordID = paperVM.records.first?.id
+                if let first = paperVM.records.first, !first.discussionMessages.isEmpty {
+                    isDiscussionExpanded = true
+                }
             }
             if !isStandaloneWindow {
                 sidebarWidth = appViewModel.sidebarWidth
@@ -458,6 +464,13 @@ struct PaperDigestWorkspaceView: View {
                         .foregroundStyle(palette.calendarTone)
                         .fixedSize()
                 }
+                if !record.discussionMessages.isEmpty {
+                    let turns = max(1, record.discussionMessages.filter { $0.role == .user }.count)
+                    Text("· 讨论 \(turns)")
+                        .font(.system(size: 10, weight: .medium))
+                        .foregroundStyle(palette.noteTone)
+                        .fixedSize()
+                }
                 Spacer(minLength: 0)
             }
             .padding(.leading, 11.5)
@@ -484,9 +497,11 @@ struct PaperDigestWorkspaceView: View {
         .contentShape(Rectangle())
         .onTapGesture {
             isNotesEditorFocused = false
+            isDiscussionInputFocused = false
             isAuthorsExpanded = false
             withAnimation(.easeInOut(duration: 0.15)) {
                 selectedRecordID = record.id
+                isDiscussionExpanded = !(record.discussionMessages.isEmpty)
             }
         }
         .onHover { hovering in
@@ -571,7 +586,11 @@ struct PaperDigestWorkspaceView: View {
                 }
                 .padding(.horizontal, 24)
                 .padding(.top, 16)
-                .padding(.bottom, 28)
+                .padding(.bottom, 24)
+            }
+
+            if let record = activeRecord {
+                paperDiscussionDock(record: record)
             }
         }
         .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
@@ -883,7 +902,7 @@ struct PaperDigestWorkspaceView: View {
             .buttonStyle(FullHitAreaButtonStyle())
             .fixedSize()
             .disabled(paperVM.isAnalyzing)
-            .keyboardShortcut(.return, modifiers: isNotesEditorFocused ? [.command, .option, .shift] : [.command])
+            .keyboardShortcut(.return, modifiers: (isNotesEditorFocused || isDiscussionInputFocused) ? [.command, .option, .shift] : [.command])
         }
         .padding(.horizontal, 12)
         .padding(.vertical, 7)
@@ -998,6 +1017,32 @@ struct PaperDigestWorkspaceView: View {
 
                     // Right Action Toolbar: Every button/menu is strictly 26pt tall with identical corner radius!
                     HStack(alignment: .center, spacing: 6) {
+                        Button {
+                            withAnimation(.spring(response: 0.26, dampingFraction: 0.86)) {
+                                isDiscussionExpanded = true
+                            }
+                            isDiscussionInputFocused = true
+                        } label: {
+                            let userTurnCount = record.discussionMessages.filter { $0.role == .user }.count
+                            HStack(spacing: 4) {
+                                Image(systemName: "bubble.left.and.bubble.right")
+                                    .font(.system(size: 10, weight: .semibold))
+                                Text(userTurnCount > 0 ? "讨论 (\(userTurnCount))" : "继续讨论")
+                                    .font(.system(size: 11, weight: .semibold))
+                                    .lineLimit(1)
+                            }
+                            .foregroundStyle(palette.calendarTone)
+                            .padding(.horizontal, 10)
+                            .frame(height: 26)
+                            .background(
+                                RoundedRectangle(cornerRadius: 6, style: .continuous)
+                                    .fill(palette.calendarTone.opacity(0.11))
+                            )
+                        }
+                        .buttonStyle(FullHitAreaButtonStyle(cornerRadius: 6))
+                        .fixedSize()
+                        .help("展开下方讨论面板，基于当前结构化卡片与 Cursor 继续深入问答")
+
                         Button {
                             paperVM.toggleStar(record.id)
                         } label: {
@@ -1380,6 +1425,347 @@ struct PaperDigestWorkspaceView: View {
         .id(record.id)
     }
 
+    // MARK: - Bottom-Docked Cursor Discussion Panel (Independent of Upper Card Scroll!)
+
+    private static let quickDiscussionPrompts: [String] = [
+        "用直白的例子解释核心方法与关键公式",
+        "这项工作的实验设计有哪些潜在漏洞或盲区？",
+        "相比现有主流基线，它最核心的收益与代价取舍是什么？",
+        "这篇论文有哪些思路值得迁移到其他任务？"
+    ]
+
+    private func submitDiscussionQuestion(for record: PaperDigestRecord, presetQuestion: String? = nil) {
+        let questionToSend = (presetQuestion ?? discussionInputText).trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !questionToSend.isEmpty, !paperVM.isDiscussing(record.id) else { return }
+
+        if presetQuestion == nil {
+            discussionInputText = ""
+        }
+        withAnimation(.spring(response: 0.26, dampingFraction: 0.86)) {
+            isDiscussionExpanded = true
+        }
+
+        let targetID = record.id
+        Task {
+            let ok = await paperVM.askFollowUpQuestion(
+                recordID: targetID,
+                question: questionToSend,
+                preferredMode: appViewModel.aiProviderMode,
+                speedProfile: appViewModel.aiSpeedProfile
+            )
+            if !ok && presetQuestion == nil && discussionInputText.isEmpty {
+                discussionInputText = questionToSend
+            }
+        }
+    }
+
+    private func paperDiscussionDock(record: PaperDigestRecord) -> some View {
+        let isBusy = paperVM.isDiscussing(record.id)
+        let hasMessages = !record.discussionMessages.isEmpty
+        let showThreadArea = isDiscussionExpanded || isBusy
+
+        return VStack(alignment: .leading, spacing: 0) {
+            Rectangle()
+                .fill(palette.hairline)
+                .frame(height: 1)
+
+            VStack(alignment: .leading, spacing: 10) {
+                // Header Strip (Visible when expanded or when prior messages exist)
+                if showThreadArea || hasMessages {
+                    HStack(alignment: .center, spacing: 8) {
+                        Image(systemName: "bubble.left.and.bubble.right.fill")
+                            .font(.system(size: 11, weight: .semibold))
+                            .foregroundStyle(palette.calendarTone)
+                            .frame(width: 16, alignment: .center)
+
+                        Text("与 Cursor 继续讨论")
+                            .font(.system(size: 12, weight: .bold))
+                            .foregroundStyle(.primary)
+
+                        Text("· 基于当前论文结构化卡片直接作答")
+                            .font(.system(size: 10.5))
+                            .foregroundStyle(.tertiary)
+                            .lineLimit(1)
+
+                        Spacer()
+
+                        if hasMessages {
+                            Button {
+                                paperVM.clearDiscussion(recordID: record.id)
+                            } label: {
+                                Text("清空对话")
+                                    .font(.system(size: 10.5, weight: .medium))
+                                    .foregroundStyle(.secondary)
+                                    .padding(.horizontal, 8)
+                                    .frame(height: 22)
+                                    .background(RoundedRectangle(cornerRadius: 5, style: .continuous).fill(palette.subtleButtonBg))
+                            }
+                            .buttonStyle(FullHitAreaButtonStyle(cornerRadius: 5))
+                            .disabled(isBusy)
+                        }
+
+                        Button {
+                            withAnimation(.spring(response: 0.25, dampingFraction: 0.86)) {
+                                isDiscussionExpanded.toggle()
+                            }
+                        } label: {
+                            HStack(spacing: 3) {
+                                Text(showThreadArea ? "收起" : "展开 (\(record.discussionMessages.filter { $0.role == .user }.count))")
+                                    .font(.system(size: 10.5, weight: .medium))
+                                Image(systemName: showThreadArea ? "chevron.down" : "chevron.up")
+                                    .font(.system(size: 8.5, weight: .bold))
+                            }
+                            .foregroundStyle(.secondary)
+                            .padding(.horizontal, 8)
+                            .frame(height: 22)
+                            .background(RoundedRectangle(cornerRadius: 5, style: .continuous).fill(palette.subtleButtonBg))
+                        }
+                        .buttonStyle(FullHitAreaButtonStyle(cornerRadius: 5))
+                    }
+                }
+
+                // Expandable Thread / Quick Starter Area
+                if showThreadArea {
+                    if !hasMessages && !isBusy {
+                        WrappingFlowLayout(horizontalSpacing: 7, verticalSpacing: 7) {
+                            ForEach(Self.quickDiscussionPrompts, id: \.self) { preset in
+                                Button {
+                                    submitDiscussionQuestion(for: record, presetQuestion: preset)
+                                } label: {
+                                    HStack(spacing: 4) {
+                                        Image(systemName: "sparkles")
+                                            .font(.system(size: 9.5, weight: .semibold))
+                                        Text(preset)
+                                            .font(.system(size: 11, weight: .medium))
+                                            .lineLimit(1)
+                                    }
+                                    .foregroundStyle(palette.calendarTone)
+                                    .padding(.horizontal, 10)
+                                    .frame(height: 25)
+                                    .background(
+                                        RoundedRectangle(cornerRadius: 6, style: .continuous)
+                                            .fill(palette.calendarTone.opacity(0.09))
+                                            .overlay(
+                                                RoundedRectangle(cornerRadius: 6, style: .continuous)
+                                                    .strokeBorder(palette.calendarTone.opacity(0.18), lineWidth: 1)
+                                            )
+                                    )
+                                }
+                                .buttonStyle(FullHitAreaButtonStyle(cornerRadius: 6))
+                            }
+                        }
+                    } else {
+                        ScrollViewReader { proxy in
+                            ScrollView(.vertical, showsIndicators: true) {
+                                VStack(alignment: .leading, spacing: 10) {
+                                    ForEach(record.discussionMessages) { msg in
+                                        discussionMessageRow(msg)
+                                            .id(msg.id)
+                                    }
+
+                                    if isBusy {
+                                        HStack(alignment: .center, spacing: 8) {
+                                            ProgressView().controlSize(.mini)
+                                                .frame(width: 16)
+                                            Text("Cursor 正在结合上方结构化卡片思考回答…")
+                                                .font(.system(size: 12))
+                                                .foregroundStyle(.secondary)
+                                        }
+                                        .padding(.vertical, 4)
+                                        .id("discussion-thinking-anchor")
+                                    }
+                                }
+                                .frame(maxWidth: .infinity, alignment: .leading)
+                                .padding(.trailing, 4)
+                            }
+                            .frame(minHeight: 90, maxHeight: 205)
+                            .onAppear {
+                                if isBusy {
+                                    proxy.scrollTo("discussion-thinking-anchor", anchor: .bottom)
+                                } else if let lastID = record.discussionMessages.last?.id {
+                                    proxy.scrollTo(lastID, anchor: .bottom)
+                                }
+                            }
+                            .onChange(of: record.discussionMessages.count) { _, _ in
+                                withAnimation(.easeOut(duration: 0.2)) {
+                                    if isBusy {
+                                        proxy.scrollTo("discussion-thinking-anchor", anchor: .bottom)
+                                    } else if let lastID = record.discussionMessages.last?.id {
+                                        proxy.scrollTo(lastID, anchor: .bottom)
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+
+                // Always-Ready Docked Input Bar (Exact 24pt Horizontal Alignment with Upper Workspace!)
+                HStack(alignment: .center, spacing: 10) {
+                    Image(systemName: "sparkles")
+                        .font(.system(size: 12.5, weight: .semibold))
+                        .foregroundStyle(palette.calendarTone)
+                        .padding(.leading, 2)
+
+                    TextField(
+                        "围绕「\(record.digest.shortAlias.isEmpty ? "当前论文" : record.digest.shortAlias)」继续向 Cursor 提问（基于结构化信息作答，按 ↩ 发送）…",
+                        text: $discussionInputText
+                    )
+                    .textFieldStyle(.plain)
+                    .font(.system(size: 12.5))
+                    .focused($isDiscussionInputFocused)
+                    .onTapGesture {
+                        if !isDiscussionExpanded {
+                            withAnimation(.spring(response: 0.25, dampingFraction: 0.86)) {
+                                isDiscussionExpanded = true
+                            }
+                        }
+                    }
+                    .onSubmit {
+                        submitDiscussionQuestion(for: record)
+                    }
+
+                    if !discussionInputText.isEmpty {
+                        Button {
+                            discussionInputText = ""
+                        } label: {
+                            Image(systemName: "xmark.circle.fill")
+                                .font(.system(size: 11.5))
+                                .foregroundStyle(.tertiary)
+                        }
+                        .buttonStyle(FullHitAreaButtonStyle())
+                    }
+
+                    Menu {
+                        Section("一键追问灵感") {
+                            ForEach(Self.quickDiscussionPrompts, id: \.self) { preset in
+                                Button(preset) {
+                                    submitDiscussionQuestion(for: record, presetQuestion: preset)
+                                }
+                            }
+                        }
+                    } label: {
+                        HStack(spacing: 4) {
+                            Image(systemName: "lightbulb")
+                                .font(.system(size: 10.5, weight: .semibold))
+                            Text("追问灵感")
+                                .font(.system(size: 11, weight: .medium))
+                                .lineLimit(1)
+                            Image(systemName: "chevron.up")
+                                .font(.system(size: 7.5, weight: .bold))
+                                .opacity(0.65)
+                        }
+                        .foregroundStyle(.secondary)
+                        .padding(.horizontal, 9)
+                        .frame(height: 25)
+                        .background(RoundedRectangle(cornerRadius: 6, style: .continuous).fill(palette.subtleButtonBg))
+                    }
+                    .menuStyle(.button)
+                    .buttonStyle(FullHitAreaButtonStyle(cornerRadius: 6))
+                    .menuIndicator(.hidden)
+                    .fixedSize()
+                    .disabled(isBusy)
+
+                    Button {
+                        submitDiscussionQuestion(for: record)
+                    } label: {
+                        let canSend = !discussionInputText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty && !isBusy
+                        HStack(spacing: 4) {
+                            if isBusy {
+                                ProgressView().controlSize(.mini)
+                                Text("思考中…")
+                                    .font(.system(size: 11, weight: .semibold))
+                                    .lineLimit(1)
+                            } else {
+                                Text("提问")
+                                    .font(.system(size: 11.5, weight: .semibold))
+                                    .lineLimit(1)
+                                Image(systemName: "arrow.up.circle.fill")
+                                    .font(.system(size: 11.5))
+                            }
+                        }
+                        .foregroundStyle(canSend || isBusy ? Color.white : Color.secondary)
+                        .padding(.horizontal, 11)
+                        .frame(height: 25)
+                        .background(
+                            RoundedRectangle(cornerRadius: 6, style: .continuous)
+                                .fill(canSend || isBusy ? palette.calendarTone : palette.subtleButtonBg)
+                        )
+                    }
+                    .buttonStyle(FullHitAreaButtonStyle(cornerRadius: 6))
+                    .fixedSize()
+                    .disabled(discussionInputText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty || isBusy)
+                    .keyboardShortcut(.return, modifiers: isDiscussionInputFocused ? [.command] : [.command, .control, .option])
+                }
+                .padding(.horizontal, 12)
+                .padding(.vertical, 6.5)
+                .background(
+                    RoundedRectangle(cornerRadius: 9, style: .continuous)
+                        .fill(palette.composerWellBg)
+                        .overlay(
+                            RoundedRectangle(cornerRadius: 9, style: .continuous)
+                                .strokeBorder(isDiscussionInputFocused ? palette.calendarTone.opacity(0.55) : palette.hairline, lineWidth: 1)
+                        )
+                )
+            }
+            .padding(.horizontal, 24)
+            .padding(.top, 10)
+            .padding(.bottom, 12)
+            .background(palette.mainCanvasBg)
+        }
+    }
+
+    private func discussionMessageRow(_ msg: PaperDiscussionMessage) -> some View {
+        let isUser = (msg.role == .user)
+
+        return HStack(alignment: .top, spacing: 8) {
+            Text(isUser ? "提问" : "Cursor")
+                .font(.system(size: 9.5, weight: .bold, design: .rounded))
+                .foregroundStyle(isUser ? palette.calendarTone : palette.committedTone)
+                .padding(.horizontal, 6)
+                .frame(height: 19)
+                .background(
+                    RoundedRectangle(cornerRadius: 4.5, style: .continuous)
+                        .fill((isUser ? palette.calendarTone : palette.committedTone).opacity(0.12))
+                )
+                .fixedSize()
+                .padding(.top, 1)
+
+            Text(Self.renderChatMarkdown(msg.content))
+                .font(.system(size: 12.5, weight: isUser ? .semibold : .regular))
+                .foregroundStyle(Color.primary.opacity(isUser ? 1.0 : 0.92))
+                .lineSpacing(4)
+                .frame(maxWidth: .infinity, alignment: .leading)
+                .textSelection(.enabled)
+
+            if !isUser {
+                Button {
+                    NSPasteboard.general.clearContents()
+                    NSPasteboard.general.setString(msg.content, forType: .string)
+                    paperVM.isErrorBanner = false
+                    paperVM.statusBanner = "📋 已复制该条 Cursor 讨论回答"
+                } label: {
+                    Image(systemName: "doc.on.doc")
+                        .font(.system(size: 10))
+                        .foregroundStyle(.tertiary)
+                        .frame(width: 22, height: 22)
+                        .background(RoundedRectangle(cornerRadius: 5, style: .continuous).fill(palette.subtleButtonBg))
+                }
+                .buttonStyle(FullHitAreaButtonStyle(cornerRadius: 5))
+                .help("复制此条回答")
+            }
+        }
+        .padding(.horizontal, 12)
+        .padding(.vertical, 9)
+        .background(
+            RoundedRectangle(cornerRadius: 8, style: .continuous)
+                .fill(isUser ? palette.calendarTone.opacity(0.055) : palette.composerWellBg)
+                .overlay(
+                    RoundedRectangle(cornerRadius: 8, style: .continuous)
+                        .strokeBorder(isUser ? palette.calendarTone.opacity(0.16) : palette.hairline, lineWidth: 1)
+                )
+        )
+    }
+
     // MARK: - Precision Aligned Reusable Subviews (16pt Icon Column + 8pt Gap = 24pt Text Indent!)
 
     private func paperSectionCard<Content: View>(
@@ -1498,6 +1884,29 @@ struct PaperDigestWorkspaceView: View {
         } else {
             return shortDateFormatter.string(from: date)
         }
+    }
+
+    private static func renderChatMarkdown(_ raw: String) -> AttributedString {
+        let cleaned = raw
+            .replacingOccurrences(of: "\\(", with: "")
+            .replacingOccurrences(of: "\\)", with: "")
+            .replacingOccurrences(of: "\\[", with: "")
+            .replacingOccurrences(of: "\\]", with: "")
+            .replacingOccurrences(of: "\\times", with: "×")
+            .replacingOccurrences(of: "\\rightarrow", with: "→")
+            .replacingOccurrences(of: "\\to", with: "→")
+            .replacingOccurrences(of: "\\approx", with: "≈")
+            .replacingOccurrences(of: "\\le", with: "≤")
+            .replacingOccurrences(of: "\\ge", with: "≥")
+            .replacingOccurrences(of: "\n- ", with: "\n• ")
+
+        if let attr = try? AttributedString(
+            markdown: cleaned,
+            options: AttributedString.MarkdownParsingOptions(interpretedSyntax: .inlineOnlyPreservingWhitespace)
+        ) {
+            return attr
+        }
+        return AttributedString(cleaned)
     }
 }
 

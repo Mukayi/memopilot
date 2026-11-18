@@ -231,4 +231,201 @@ public enum PaperDigestAnalyzer {
         15. `limitations`：3~5 条客观局限性、评测盲区或未来改进方向（站在严格审稿人视角，拒绝报喜不报忧）。
         """
     }
+
+    // MARK: - Multi-Turn Follow-Up Discussion Grounded in Structured PaperDigest
+
+    public static func askFollowUp(
+        record: PaperDigestRecord,
+        priorHistory: [PaperDiscussionMessage],
+        question: String,
+        preferredMode: AIProviderMode = .auto,
+        speedProfile: AISpeedProfile = .balanced
+    ) async throws -> String {
+        let cleanQuestion = question.replacingOccurrences(of: "\0", with: "").trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !cleanQuestion.isEmpty else {
+            throw NSError(
+                domain: "MemoPilot.PaperChat",
+                code: 400,
+                userInfo: [NSLocalizedDescriptionKey: "请输入要讨论的问题"]
+            )
+        }
+
+        let prompt = buildFollowUpDiscussionPrompt(
+            record: record,
+            priorHistory: priorHistory,
+            question: cleanQuestion
+        )
+
+        return try await Task.detached(priority: .userInitiated) { () throws -> String in
+            let tempDir = FileManager.default.temporaryDirectory
+                .appendingPathComponent("MemoPilot-PaperChat-\(UUID().uuidString)", isDirectory: true)
+            try FileManager.default.createDirectory(at: tempDir, withIntermediateDirectories: true)
+            defer { try? FileManager.default.removeItem(at: tempDir) }
+
+            let codexPath = CodexCLIBridge.findCodexBinary()
+            let codexLoggedIn = CodexCLIBridge.isCodexAuthenticated(codexBinary: codexPath)
+
+            let effectiveModelSlug: String = (speedProfile == .flash)
+                ? AISpeedProfile.balanced.cursorModelSlug
+                : speedProfile.cursorModelSlug
+
+            var cursorAttemptError: Error?
+            if preferredMode != .openai,
+               let cursorBin = CodexCLIBridge.findCursorAgentBinary(),
+               let cursorKey = CodexCLIBridge.discoverCursorApiKey() {
+                do {
+                    let output = try CodexCLIBridge.runProcess(
+                        cursorBin,
+                        arguments: [
+                            "--api-key", cursorKey,
+                            "--trust",
+                            "--workspace", tempDir.path,
+                            "--model", effectiveModelSlug,
+                            "-p",
+                            "--mode", "ask",
+                            "--",
+                            prompt
+                        ],
+                        workingDirectoryURL: tempDir,
+                        timeout: 65.0
+                    )
+                    let trimmed = output.trimmingCharacters(in: .whitespacesAndNewlines)
+                    if !trimmed.isEmpty {
+                        return trimmed
+                    }
+                } catch {
+                    cursorAttemptError = error
+                    if preferredMode == .cursor {
+                        throw error
+                    }
+                }
+            }
+
+            guard let codexPath else {
+                if let cursorAttemptError { throw cursorAttemptError }
+                throw NSError(
+                    domain: "MemoPilot.PaperChat",
+                    code: 404,
+                    userInfo: [NSLocalizedDescriptionKey: "未检测到可用的 Cursor 连接或 OpenAI Codex CLI。"]
+                )
+            }
+
+            guard codexLoggedIn else {
+                if let cursorAttemptError { throw cursorAttemptError }
+                throw NSError(
+                    domain: "MemoPilot.PaperChat",
+                    code: 401,
+                    userInfo: [NSLocalizedDescriptionKey: "尚未登录 OpenAI Codex 账号，请在右上角连接状态菜单中完成登录。"]
+                )
+            }
+
+            let outputURL = tempDir.appendingPathComponent("chat_reply.txt")
+            let args: [String] = [
+                "exec",
+                "--ephemeral",
+                "-C", tempDir.path,
+                "-c", "mcp_servers={}",
+                "-c", "model_reasoning_effort=\"\(speedProfile.codexReasoningEffort)\"",
+                "--disable", "shell_tool",
+                "--disable", "shell_snapshot",
+                "--disable", "plugins",
+                "--disable", "apps",
+                "--disable", "browser_use",
+                "--disable", "computer_use",
+                "--skip-git-repo-check",
+                "--sandbox", "read-only",
+                "-o", outputURL.path,
+                "--",
+                prompt
+            ]
+
+            let processOut = try CodexCLIBridge.runProcess(
+                codexPath,
+                arguments: args,
+                workingDirectoryURL: tempDir,
+                timeout: 75.0
+            )
+            let replyText: String
+            if FileManager.default.fileExists(atPath: outputURL.path),
+               let fileStr = try? String(contentsOf: outputURL, encoding: .utf8),
+               !fileStr.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+                replyText = fileStr
+            } else {
+                replyText = processOut
+            }
+            let cleanedReply = replyText.trimmingCharacters(in: .whitespacesAndNewlines)
+            guard !cleanedReply.isEmpty else {
+                throw NSError(
+                    domain: "MemoPilot.PaperChat",
+                    code: 500,
+                    userInfo: [NSLocalizedDescriptionKey: "AI 未返回回答内容，请稍后重试。"]
+                )
+            }
+            return cleanedReply
+        }.value
+    }
+
+    public static func buildFollowUpDiscussionPrompt(
+        record: PaperDigestRecord,
+        priorHistory: [PaperDiscussionMessage],
+        question: String
+    ) -> String {
+        let d = record.digest
+        var contextLines: [String] = []
+        contextLines.append("论文标题：\(d.primaryDisplayTitle)")
+        if !d.paperTitleZH.isEmpty { contextLines.append("中文标题：\(d.paperTitleZH)") }
+        if !d.authorsAndAffiliations.isEmpty { contextLines.append("作者与机构：\(d.authorsAndAffiliations)") }
+        if !d.venueAndDate.isEmpty { contextLines.append("发表状态：\(d.venueAndDate)") }
+        if !d.domainTags.isEmpty { contextLines.append("领域标签：\(d.domainTags.joined(separator: ", "))") }
+        if !d.oneLineConclusion.isEmpty { contextLines.append("\n【一句话核心结论】：\n\(d.oneLineConclusion)") }
+        if !d.whyItMatters.isEmpty { contextLines.append("\n【为什么值得读】：\n\(d.whyItMatters)") }
+        if !d.problemAndBottlenecks.isEmpty {
+            contextLines.append("\n【面向的问题与瓶颈】：\n" + d.problemAndBottlenecks.map { "- \($0)" }.joined(separator: "\n"))
+        }
+        if !d.scopeBoundary.isEmpty { contextLines.append("\n【结论边界与前提】：\n\(d.scopeBoundary)") }
+        if !d.methodSteps.isEmpty {
+            let steps = d.methodSteps.enumerated().map { "\($0.offset + 1). \($0.element)" }.joined(separator: "\n")
+            contextLines.append("\n【核心方法拆解】：\n\(steps)")
+        }
+        if !d.keyResults.isEmpty {
+            contextLines.append("\n【关键实验与量化证据】：\n" + d.keyResults.map { "- \($0)" }.joined(separator: "\n"))
+        }
+        if !d.computeAndTradeoffs.isEmpty { contextLines.append("\n【算力与工程代价权衡】：\n\(d.computeAndTradeoffs)") }
+        if !d.limitations.isEmpty {
+            contextLines.append("\n【局限性与未来方向】：\n" + d.limitations.map { "- \($0)" }.joined(separator: "\n"))
+        }
+        if !record.userNotes.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+            contextLines.append("\n【用户的个人批注】：\n\(record.userNotes)")
+        }
+
+        let recentTurns = priorHistory.suffix(10)
+        let historyText: String
+        if recentTurns.isEmpty {
+            historyText = "（当前为第一轮提问）"
+        } else {
+            historyText = recentTurns.map { turn in
+                let speaker = (turn.role == .user) ? "用户" : "助手"
+                return "[\(speaker)]：\(turn.content)"
+            }.joined(separator: "\n\n")
+        }
+
+        return """
+        你是用户的学术科研搭档（Cursor 研究助手）。用户正在阅读下方这篇已提取好结构化信息的论文卡片，并希望围绕这篇工作与你继续深入讨论。
+
+        请严格遵守以下回答原则：
+        1. 直接基于下方的【论文结构化信息】（及【历史对话】）作答，绝不要调用任何外部工具或联网命令。
+        2. 结论先行、逻辑锋利、言之有物，避免空泛客套话。引用方法步骤、消融结论或实验指标时尽量带上卡片中的具体数据或符号。
+        3. 如果用户追问的某个超细枝末节并未包含在上方结构化摘要中，请诚实指出「当前结构化摘要未披露该具体实现细节」，并基于现有机制给出有根据的技术推演（明确标注为推演，绝不编造实验数字）。
+        4. 排版清爽易读：可使用简短分段、`• ` 要点列表和 `**加粗**` 突出重点，数学符号请直接使用易读纯文本/Unicode（如 x_0、v、σ、1×p×p、→、≈），不要使用 `\\(...\\)` 或 `\\[...\\]` 反斜杠包裹，也不要输出二级大标题。
+
+        ================ 论文结构化信息 ================
+        \(contextLines.joined(separator: "\n"))
+
+        ================ 历史讨论上下文 ================
+        \(historyText)
+
+        ================ 用户当前提问 ================
+        \(question)
+        """
+    }
 }

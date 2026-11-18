@@ -6,6 +6,7 @@ import MemoPilotCore
 final class PaperDigestViewModel: ObservableObject {
     @Published var isAnalyzing: Bool = false
     @Published var isArchivingNotes: Bool = false
+    @Published private(set) var discussingRecordIDs: Set<UUID> = []
     @Published var statusBanner: String?
     @Published var isErrorBanner: Bool = false
 
@@ -89,6 +90,76 @@ final class PaperDigestViewModel: ObservableObject {
         statusBanner = nil
         isErrorBanner = false
         saveRecordsImmediately()
+    }
+
+    // MARK: - Multi-Turn Discussion With Cursor
+
+    func isDiscussing(_ recordID: UUID) -> Bool {
+        discussingRecordIDs.contains(recordID)
+    }
+
+    func clearDiscussion(recordID: UUID) {
+        guard let idx = records.firstIndex(where: { $0.id == recordID }) else { return }
+        records[idx].discussionMessages.removeAll()
+        records[idx].updatedAt = Date()
+        saveRecordsImmediately()
+    }
+
+    @discardableResult
+    func askFollowUpQuestion(
+        recordID: UUID,
+        question: String,
+        preferredMode: AIProviderMode,
+        speedProfile: AISpeedProfile
+    ) async -> Bool {
+        let trimmed = question.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty,
+              !discussingRecordIDs.contains(recordID),
+              let initialIdx = records.firstIndex(where: { $0.id == recordID }) else {
+            return false
+        }
+
+        let snapshotRecord = records[initialIdx]
+        let priorHistory = snapshotRecord.discussionMessages
+        let userMsg = PaperDiscussionMessage(role: .user, content: trimmed)
+
+        withAnimation(.easeInOut(duration: 0.16)) {
+            records[initialIdx].discussionMessages.append(userMsg)
+            records[initialIdx].updatedAt = Date()
+            discussingRecordIDs.insert(recordID)
+            isErrorBanner = false
+        }
+        saveRecordsImmediately()
+        defer { discussingRecordIDs.remove(recordID) }
+
+        do {
+            let answer = try await PaperDigestAnalyzer.askFollowUp(
+                record: snapshotRecord,
+                priorHistory: priorHistory,
+                question: trimmed,
+                preferredMode: preferredMode,
+                speedProfile: speedProfile
+            )
+            let assistantMsg = PaperDiscussionMessage(role: .assistant, content: answer)
+            withAnimation(.spring(response: 0.28, dampingFraction: 0.86)) {
+                if let targetIdx = records.firstIndex(where: { $0.id == recordID }) {
+                    records[targetIdx].discussionMessages.append(assistantMsg)
+                    records[targetIdx].updatedAt = Date()
+                    saveRecordsImmediately()
+                }
+            }
+            return true
+        } catch {
+            withAnimation(.easeInOut(duration: 0.18)) {
+                if let targetIdx = records.firstIndex(where: { $0.id == recordID }) {
+                    records[targetIdx].discussionMessages.removeAll { $0.id == userMsg.id }
+                    saveRecordsImmediately()
+                }
+                isErrorBanner = true
+                statusBanner = "继续讨论请求失败：\(error.localizedDescription)"
+            }
+            return false
+        }
     }
 
     // MARK: - Analyze Link / Article

@@ -603,6 +603,21 @@ final class AppViewModel: ObservableObject {
             AppDelegate.capturePaperWindow(to: outPath)
             CursorRemoteControl.writeResponse("✅ 已保存独立论文窗口画面至：\(outPath)")
 
+        case "ask-paper":
+            guard let firstRec = paperViewModel.records.first else {
+                CursorRemoteControl.writeResponse("⚠️ 当前暂无论文记录可供讨论")
+                return
+            }
+            let question = cmd.text ?? "这篇工作的核心方法为什么选直接预测干净视频 x_0 而不是速度 v？"
+            let ok = await paperViewModel.askFollowUpQuestion(
+                recordID: firstRec.id,
+                question: question,
+                preferredMode: aiProviderMode,
+                speedProfile: aiSpeedProfile
+            )
+            let replyPreview = paperViewModel.record(id: firstRec.id)?.discussionMessages.last?.content.prefix(120) ?? ""
+            CursorRemoteControl.writeResponse(ok ? "✅ 论文讨论完成：\(replyPreview)…" : "❌ 讨论失败：\(paperViewModel.statusBanner ?? "")")
+
         default:
             CursorRemoteControl.writeResponse("⚠️ 未知指令：\(cmd.action)")
         }

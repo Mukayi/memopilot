@@ -258,6 +258,30 @@ public struct PaperDigest: Codable, Equatable, Sendable {
     }
 }
 
+public struct PaperDiscussionMessage: Codable, Identifiable, Equatable, Sendable {
+    public enum Role: String, Codable, Sendable {
+        case user
+        case assistant
+    }
+
+    public var id: UUID
+    public var role: Role
+    public var content: String
+    public var createdAt: Date
+
+    public init(
+        id: UUID = UUID(),
+        role: Role,
+        content: String,
+        createdAt: Date = Date()
+    ) {
+        self.id = id
+        self.role = role
+        self.content = content
+        self.createdAt = createdAt
+    }
+}
+
 public struct PaperDigestRecord: Codable, Identifiable, Equatable, Sendable {
     public var id: UUID
     public var createdAt: Date
@@ -267,6 +291,7 @@ public struct PaperDigestRecord: Codable, Identifiable, Equatable, Sendable {
     public var appleNoteExternalID: String?
     public var exportedMarkdownPath: String?
     public var userNotes: String
+    public var discussionMessages: [PaperDiscussionMessage]
     public var digest: PaperDigest
 
     public init(
@@ -278,6 +303,7 @@ public struct PaperDigestRecord: Codable, Identifiable, Equatable, Sendable {
         appleNoteExternalID: String? = nil,
         exportedMarkdownPath: String? = nil,
         userNotes: String = "",
+        discussionMessages: [PaperDiscussionMessage] = [],
         digest: PaperDigest
     ) {
         self.id = id
@@ -288,6 +314,7 @@ public struct PaperDigestRecord: Codable, Identifiable, Equatable, Sendable {
         self.appleNoteExternalID = appleNoteExternalID
         self.exportedMarkdownPath = exportedMarkdownPath
         self.userNotes = userNotes
+        self.discussionMessages = discussionMessages
         self.digest = digest
     }
 
@@ -301,6 +328,7 @@ public struct PaperDigestRecord: Codable, Identifiable, Equatable, Sendable {
         appleNoteExternalID = try? c.decodeIfPresent(String.self, forKey: .appleNoteExternalID)
         exportedMarkdownPath = try? c.decodeIfPresent(String.self, forKey: .exportedMarkdownPath)
         userNotes = (try? c.decodeIfPresent(String.self, forKey: .userNotes)) ?? ""
+        discussionMessages = (try? c.decodeIfPresent([PaperDiscussionMessage].self, forKey: .discussionMessages)) ?? []
         digest = (try? c.decodeIfPresent(PaperDigest.self, forKey: .digest)) ?? PaperDigest()
     }
 
@@ -333,7 +361,7 @@ public struct PaperDigestRecord: Codable, Identifiable, Equatable, Sendable {
             digest.scopeBoundary,
             digest.computeAndTradeoffs,
             userNotes
-        ] + digest.domainTags + digest.problemAndBottlenecks + digest.methodSteps + digest.keyResults + digest.limitations
+        ] + digest.domainTags + digest.problemAndBottlenecks + digest.methodSteps + digest.keyResults + digest.limitations + discussionMessages.map(\.content)
 
         return fields.contains { $0.lowercased().contains(trimmed) }
     }
@@ -491,6 +519,15 @@ public struct PaperDigestRecord: Codable, Identifiable, Equatable, Sendable {
         if !userNotes.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
             lines.append("## 个人批注与思考")
             lines.append(userNotes.trimmingCharacters(in: .whitespacesAndNewlines))
+            lines.append("")
+        }
+
+        if !discussionMessages.isEmpty {
+            lines.append("## 延伸讨论记录")
+            for msg in discussionMessages {
+                let speaker = (msg.role == .user) ? "**提问**" : "**Cursor 解析**"
+                lines.append("- \(speaker)：\(msg.content)")
+            }
             lines.append("")
         }
 

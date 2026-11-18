@@ -417,4 +417,34 @@ struct MemoPilotTests {
             _ = try PaperDigest.decode(from: "{\"error\": \"rate_limit\"}")
         }
     }
+
+    @Test("PaperDigestRecord persists multi-turn Cursor discussion messages, matches search queries, and builds structured follow-up prompts")
+    func paperDiscussionThreadPersistenceAndPrompt() throws {
+        let digest = PaperDigest(
+            paperTitleEN: "Back to Pixels",
+            shortAlias: "PixVid",
+            oneLineConclusion: "控制延迟从 495ms 压到 34ms",
+            methodSteps: ["直接预测干净视频 x_0"]
+        )
+        let turns: [PaperDiscussionMessage] = [
+            PaperDiscussionMessage(role: .user, content: "为什么选 x_0 预测而不是速度 v？"),
+            PaperDiscussionMessage(role: .assistant, content: "在大像素 patch (p=16) 下，x_0 预测把逐像素噪声中位数从 62.25 降到了 0.78。")
+        ]
+        let record = PaperDigestRecord(discussionMessages: turns, digest: digest)
+
+        #expect(record.matches(query: "62.25") == true)
+        let md = record.toMarkdown(includeFrontmatter: false)
+        #expect(md.contains("## 延伸讨论记录"))
+        #expect(md.contains("为什么选 x_0 预测而不是速度 v？"))
+
+        let prompt = PaperDigestAnalyzer.buildFollowUpDiscussionPrompt(
+            record: record,
+            priorHistory: turns,
+            question: "那它的显存代价为什么变大了？"
+        )
+        #expect(prompt.contains("PixVid: Back to Pixels"))
+        #expect(prompt.contains("直接预测干净视频 x_0"))
+        #expect(prompt.contains("62.25"))
+        #expect(prompt.contains("那它的显存代价为什么变大了？"))
+    }
 }

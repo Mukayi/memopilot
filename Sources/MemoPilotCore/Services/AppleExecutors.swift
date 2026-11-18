@@ -766,6 +766,14 @@ public final class AppleExecutors: @unchecked Sendable {
             let safeUserNote = htmlEscape(record.userNotes).replacingOccurrences(of: "\n", with: "<br>")
             htmlParts.append("<h2>个人批注</h2><p>\(safeUserNote)</p>")
         }
+        if !record.discussionMessages.isEmpty {
+            let items = record.discussionMessages.map { msg in
+                let prefix = (msg.role == .user) ? "<b>提问：</b>" : "<b>Cursor：</b>"
+                let body = htmlEscape(msg.content).replacingOccurrences(of: "\n", with: "<br>")
+                return "<li>\(prefix)\(body)</li>"
+            }.joined()
+            htmlParts.append("<h2>延伸讨论记录</h2><ul>\(items)</ul>")
+        }
 
         let fullHTML = htmlParts.joined(separator: "\n")
         let folderName = "MemoPilot 论文速递"

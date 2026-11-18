@@ -60,7 +60,7 @@ public enum CursorRemoteControl {
             deliverImmediately: true
         )
 
-        let timeoutSeconds = (command.action == "analyze" || command.action == "analyze-paper") ? 95.0 : 5.0
+        let timeoutSeconds = ["analyze", "analyze-paper", "ask-paper"].contains(command.action) ? 95.0 : 5.0
         let deadline = Date().addingTimeInterval(timeoutSeconds)
         while Date() < deadline {
             if FileManager.default.fileExists(atPath: responseFilePath),
