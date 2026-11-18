@@ -768,7 +768,7 @@ public final class AppleExecutors: @unchecked Sendable {
         }
         if !record.discussionMessages.isEmpty {
             let items = record.discussionMessages.map { msg in
-                let prefix = (msg.role == .user) ? "<b>提问：</b>" : "<b>Cursor：</b>"
+                let prefix = (msg.role == .user) ? "<b>提问：</b>" : "<b>解答：</b>"
                 let body = htmlEscape(msg.content).replacingOccurrences(of: "\n", with: "<br>")
                 return "<li>\(prefix)\(body)</li>"
             }.joined()

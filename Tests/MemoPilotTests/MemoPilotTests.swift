@@ -418,7 +418,7 @@ struct MemoPilotTests {
         }
     }
 
-    @Test("PaperDigestRecord persists multi-turn Cursor discussion messages, matches search queries, and builds structured follow-up prompts")
+    @Test("PaperDigestRecord persists multi-turn discussion messages, omits Cursor branding, indents multi-line Markdown, and injects original PDF excerpts")
     func paperDiscussionThreadPersistenceAndPrompt() throws {
         let digest = PaperDigest(
             paperTitleEN: "Back to Pixels",
@@ -428,23 +428,126 @@ struct MemoPilotTests {
         )
         let turns: [PaperDiscussionMessage] = [
             PaperDiscussionMessage(role: .user, content: "为什么选 x_0 预测而不是速度 v？"),
-            PaperDiscussionMessage(role: .assistant, content: "在大像素 patch (p=16) 下，x_0 预测把逐像素噪声中位数从 62.25 降到了 0.78。")
+            PaperDiscussionMessage(role: .assistant, content: "核心原因有两点：\n• x_0 流形维度更低\n• 逐像素噪声中位数从 62.25 降到了 0.78。")
         ]
         let record = PaperDigestRecord(discussionMessages: turns, digest: digest)
 
         #expect(record.matches(query: "62.25") == true)
         let md = record.toMarkdown(includeFrontmatter: false)
         #expect(md.contains("## 延伸讨论记录"))
-        #expect(md.contains("为什么选 x_0 预测而不是速度 v？"))
+        #expect(md.contains("- **解答**：核心原因有两点：\n  • x_0 流形维度更低"))
+        #expect(!md.contains("Cursor"))
+
+        let pdfDoc = ExtractedPDFDocument(
+            pageCount: 12,
+            pages: [
+                PDFPageChunk(pageNumber: 1, text: "Abstract: Back to Pixels lifts Wan2.1 into pixel space."),
+                PDFPageChunk(pageNumber: 7, text: "Table 3: Learning rate is 2e-5 with AdamW and Oklab LPIPS loss.")
+            ]
+        )
 
         let prompt = PaperDigestAnalyzer.buildFollowUpDiscussionPrompt(
             record: record,
             priorHistory: turns,
-            question: "那它的显存代价为什么变大了？"
+            question: "原论文的学习率和损失函数是怎么设置的？",
+            pdfDocument: pdfDoc
         )
+        #expect(!prompt.contains("Cursor"))
         #expect(prompt.contains("PixVid: Back to Pixels"))
-        #expect(prompt.contains("直接预测干净视频 x_0"))
-        #expect(prompt.contains("62.25"))
-        #expect(prompt.contains("那它的显存代价为什么变大了？"))
+        #expect(prompt.contains("原始论文 PDF 原文节选（共 12 页）"))
+        #expect(prompt.contains("[PDF 第 7 页]"))
+        #expect(prompt.contains("Learning rate is 2e-5 with AdamW"))
+    }
+
+    @Test("PaperPDFService question-aware retrieval ranks relevant appendix/table pages within budget and PaperDigestStore prunes orphan PDF cache")
+    func paperPDFPageRetrievalAndCachePruning() throws {
+        var manyPages: [PDFPageChunk] = []
+        for p in 1...25 {
+            let filler = String(repeating: "generic background derivation on page \(p). ", count: 50)
+            if p == 18 {
+                manyPages.append(PDFPageChunk(pageNumber: p, text: "Appendix C Table 5: Detailer CNN uses 3 residual stages, learning rate 1.5e-4, batch size 64. " + filler))
+            } else {
+                manyPages.append(PDFPageChunk(pageNumber: p, text: filler))
+            }
+        }
+        let longDoc = ExtractedPDFDocument(pageCount: 25, pages: manyPages)
+        #expect(longDoc.totalCharacterCount > 45_000)
+
+        let selected = PaperPDFService.selectRelevantPDFContext(
+            from: longDoc,
+            question: "附录里 Detailer 的学习率和 Table 5 超参数是多少？",
+            priorHistory: [],
+            maxBudgetChars: 12_000
+        )
+        // Always includes Page 1 AND ranks Page 18 to the top!
+        #expect(selected.contains("[PDF 第 1 页]"))
+        #expect(selected.contains("[PDF 第 18 页]"))
+        #expect(selected.contains("learning rate 1.5e-4"))
+        #expect(selected.count <= 13_000)
+
+        // Verify PDF magic header check & store orphan cleanup
+        #expect(PaperPDFService.containsPDFMagicHeader(Data("%PDF-1.7\n...".utf8)) == true)
+        #expect(PaperPDFService.containsPDFMagicHeader(Data("<html>captcha</html>".utf8)) == false)
+
+        let tempDir = FileManager.default.temporaryDirectory.appendingPathComponent("MemoPilotPDFClean-\(UUID().uuidString)")
+        defer { try? FileManager.default.removeItem(at: tempDir) }
+        let store = PaperDigestStore(baseDirectoryURL: tempDir)
+        let keepID = UUID()
+        let orphanID = UUID()
+        try Data("%PDF-1.7".utf8).write(to: store.cachedPDFFileURL(for: keepID))
+        try Data("%PDF-1.7".utf8).write(to: store.cachedPDFFileURL(for: orphanID))
+        try Data("{}".utf8).write(to: store.cachedPDFPagesFileURL(for: orphanID))
+
+        store.pruneOrphanedPDFAssets(keepingRecordIDs: [keepID])
+        #expect(FileManager.default.fileExists(atPath: store.cachedPDFFileURL(for: keepID).path) == true)
+        #expect(FileManager.default.fileExists(atPath: store.cachedPDFFileURL(for: orphanID).path) == false)
+        #expect(FileManager.default.fileExists(atPath: store.cachedPDFPagesFileURL(for: orphanID).path) == false)
+    }
+
+    @Test("ChatMarkdownFormatter preserves math subscripts and asterisks while parsing headings, line-1 bullets, and fenced code blocks")
+    func chatMarkdownMathSafeAndBlockParsing() {
+        let rawReply = """
+        ### 核心公式对比
+        - 在 `1*p*p` 大块像素下，**(x_t)_{t=1}** 与 x_0 预测满足 L_total = L_1 + λ * L_lpips：
+        1. 第一步计算 W_q * h_t
+        | 配置 | 480p | 960p |
+        |---|---:|---:|
+        | 像素块 | 1×16×16 | 1×32×32 |
+        ```python
+        loss = l1_loss(x_pred, x_0) + 0.5 * lpips(x_pred, x_0)
+        ```
+        """
+        let blocks = ChatMarkdownFormatter.parseBlocks(rawReply)
+        #expect(blocks.count == 5)
+        #expect(blocks[0] == .heading("核心公式对比"))
+        if case .bulletItem(let marker, let body) = blocks[1] {
+            #expect(marker == "•")
+            let attr = ChatMarkdownFormatter.makeSafeAttributedString(body)
+            let plain = String(attr.characters)
+            // Underscores in `(x_t)_{t=1}`, `x_0`, `L_total`, `L_1`, `L_lpips` and `*` in `λ * L_lpips` must NOT be eaten!
+            #expect(plain.contains("(x_t)_{t=1}"))
+            #expect(plain.contains("x_0"))
+            #expect(plain.contains("L_total = L_1 + λ * L_lpips"))
+            #expect(plain.contains("1*p*p"))
+        } else {
+            Issue.record("Expected bulletItem at index 1")
+        }
+        if case .bulletItem(let numMarker, _) = blocks[2] {
+            #expect(numMarker == "1.")
+        } else {
+            Issue.record("Expected numbered bulletItem at index 2")
+        }
+        if case .table(let headers, let rows) = blocks[3] {
+            #expect(headers == ["配置", "480p", "960p"])
+            #expect(rows == [["像素块", "1×16×16", "1×32×32"]])
+        } else {
+            Issue.record("Expected table at index 3")
+        }
+        if case .codeBlock(let lang, let code) = blocks[4] {
+            #expect(lang == "python")
+            #expect(code.contains("l1_loss(x_pred, x_0)"))
+        } else {
+            Issue.record("Expected codeBlock at index 4")
+        }
     }
 }

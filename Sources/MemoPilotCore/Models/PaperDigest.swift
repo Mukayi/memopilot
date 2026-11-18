@@ -190,6 +190,16 @@ public struct PaperDigest: Codable, Equatable, Sendable {
         !codeURL.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
     }
 
+    public var compactVenueBadgeText: String {
+        var s = venueAndDate.trimmingCharacters(in: .whitespacesAndNewlines)
+        for noiseMarker in ["，未提供", "，文中未", "，尚未", "（未提供", "（文中未", "(未提供"] {
+            if let r = s.range(of: noiseMarker) {
+                s = String(s[..<r.lowerBound]).trimmingCharacters(in: .whitespacesAndNewlines)
+            }
+        }
+        return s
+    }
+
     public static func extractPaperJSONObject(from raw: String) -> String {
         let trimmed = raw.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !trimmed.isEmpty else { return trimmed }
@@ -290,6 +300,8 @@ public struct PaperDigestRecord: Codable, Identifiable, Equatable, Sendable {
     public var isArchivedToNotes: Bool
     public var appleNoteExternalID: String?
     public var exportedMarkdownPath: String?
+    public var cachedPDFPath: String?
+    public var cachedPDFPageCount: Int?
     public var userNotes: String
     public var discussionMessages: [PaperDiscussionMessage]
     public var digest: PaperDigest
@@ -302,6 +314,8 @@ public struct PaperDigestRecord: Codable, Identifiable, Equatable, Sendable {
         isArchivedToNotes: Bool = false,
         appleNoteExternalID: String? = nil,
         exportedMarkdownPath: String? = nil,
+        cachedPDFPath: String? = nil,
+        cachedPDFPageCount: Int? = nil,
         userNotes: String = "",
         discussionMessages: [PaperDiscussionMessage] = [],
         digest: PaperDigest
@@ -313,6 +327,8 @@ public struct PaperDigestRecord: Codable, Identifiable, Equatable, Sendable {
         self.isArchivedToNotes = isArchivedToNotes
         self.appleNoteExternalID = appleNoteExternalID
         self.exportedMarkdownPath = exportedMarkdownPath
+        self.cachedPDFPath = cachedPDFPath
+        self.cachedPDFPageCount = cachedPDFPageCount
         self.userNotes = userNotes
         self.discussionMessages = discussionMessages
         self.digest = digest
@@ -327,6 +343,8 @@ public struct PaperDigestRecord: Codable, Identifiable, Equatable, Sendable {
         isArchivedToNotes = (try? c.decodeIfPresent(Bool.self, forKey: .isArchivedToNotes)) ?? false
         appleNoteExternalID = try? c.decodeIfPresent(String.self, forKey: .appleNoteExternalID)
         exportedMarkdownPath = try? c.decodeIfPresent(String.self, forKey: .exportedMarkdownPath)
+        cachedPDFPath = try? c.decodeIfPresent(String.self, forKey: .cachedPDFPath)
+        cachedPDFPageCount = try? c.decodeIfPresent(Int.self, forKey: .cachedPDFPageCount)
         userNotes = (try? c.decodeIfPresent(String.self, forKey: .userNotes)) ?? ""
         discussionMessages = (try? c.decodeIfPresent([PaperDiscussionMessage].self, forKey: .discussionMessages)) ?? []
         digest = (try? c.decodeIfPresent(PaperDigest.self, forKey: .digest)) ?? PaperDigest()
@@ -525,8 +543,11 @@ public struct PaperDigestRecord: Codable, Identifiable, Equatable, Sendable {
         if !discussionMessages.isEmpty {
             lines.append("## 延伸讨论记录")
             for msg in discussionMessages {
-                let speaker = (msg.role == .user) ? "**提问**" : "**Cursor 解析**"
-                lines.append("- \(speaker)：\(msg.content)")
+                let speaker = (msg.role == .user) ? "**提问**" : "**解答**"
+                let indentedBody = msg.content
+                    .trimmingCharacters(in: .whitespacesAndNewlines)
+                    .replacingOccurrences(of: "\n", with: "\n  ")
+                lines.append("- \(speaker)：\(indentedBody)")
             }
             lines.append("")
         }

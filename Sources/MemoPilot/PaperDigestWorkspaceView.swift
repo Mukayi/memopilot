@@ -1,5 +1,6 @@
 import SwiftUI
 import AppKit
+import UniformTypeIdentifiers
 import MemoPilotCore
 
 // MARK: - Responsive Flush-Left Wrapping FlowLayout (Prevents Tag / Link Pill Overflow)
@@ -10,13 +11,16 @@ struct WrappingFlowLayout: Layout {
 
     func sizeThatFits(proposal: ProposedViewSize, subviews: Subviews, cache: inout ()) -> CGSize {
         let maxWidth = proposal.width ?? .infinity
+        let childProposal = ProposedViewSize(width: maxWidth.isFinite ? maxWidth : nil, height: nil)
         var currentX: CGFloat = 0
         var currentY: CGFloat = 0
         var rowHeight: CGFloat = 0
         var maxUsedWidth: CGFloat = 0
 
         for subview in subviews {
-            let size = subview.sizeThatFits(.unspecified)
+            let rawSize = subview.sizeThatFits(childProposal)
+            let clampedWidth = maxWidth.isFinite ? min(rawSize.width, maxWidth) : rawSize.width
+            let size = CGSize(width: clampedWidth, height: rawSize.height)
             if currentX > 0 && currentX + size.width > maxWidth {
                 maxUsedWidth = max(maxUsedWidth, currentX - horizontalSpacing)
                 currentX = 0
@@ -34,13 +38,16 @@ struct WrappingFlowLayout: Layout {
     }
 
     func placeSubviews(in bounds: CGRect, proposal: ProposedViewSize, subviews: Subviews, cache: inout ()) {
+        let availWidth = max(bounds.width, 1)
+        let childProposal = ProposedViewSize(width: availWidth, height: nil)
         var currentX = bounds.minX
         var currentY = bounds.minY
         var rowHeight: CGFloat = 0
 
         for subview in subviews {
-            let size = subview.sizeThatFits(.unspecified)
-            if currentX > bounds.minX && currentX + size.width > bounds.maxX {
+            let rawSize = subview.sizeThatFits(childProposal)
+            let size = CGSize(width: min(rawSize.width, availWidth), height: rawSize.height)
+            if currentX > bounds.minX && currentX + size.width > bounds.maxX + 0.5 {
                 currentX = bounds.minX
                 currentY += rowHeight + verticalSpacing
                 rowHeight = 0
@@ -74,8 +81,13 @@ struct PaperDigestWorkspaceView: View {
     @State private var isRecentSectionExpanded: Bool = true
     @State private var isShowingClearConfirmation: Bool = false
     @State private var isAuthorsExpanded: Bool = false
-    @State private var discussionInputText: String = ""
+    @State private var isURLBarCollapsed: Bool = false
     @State private var isDiscussionExpanded: Bool = false
+    @State private var discussionThreadHeight: CGFloat = 185
+    @State private var dragStartDiscussionHeight: CGFloat?
+    @State private var isHoveringDiscussionDivider: Bool = false
+    @State private var isDropTargetingURLBar: Bool = false
+    @State private var isDropTargetingDiscussion: Bool = false
 
     @FocusState private var isURLInputFocused: Bool
     @FocusState private var isSearchFocused: Bool
@@ -131,12 +143,13 @@ struct PaperDigestWorkspaceView: View {
         .onAppear {
             if selectedRecordID == nil {
                 selectedRecordID = paperVM.records.first?.id
-                if let first = paperVM.records.first, !first.discussionMessages.isEmpty {
-                    isDiscussionExpanded = true
+                if let first = paperVM.records.first {
+                    isDiscussionExpanded = !first.discussionMessages.isEmpty
+                    paperVM.prefetchPDFIfNeeded(for: first.id, silent: true)
                 }
             }
             if !isStandaloneWindow {
-                sidebarWidth = appViewModel.sidebarWidth
+                sidebarWidth = min(max(appViewModel.sidebarWidth, 235), 315)
             }
             appViewModel.refreshCodexStatus()
         }
@@ -144,7 +157,26 @@ struct PaperDigestWorkspaceView: View {
             if let newID {
                 selectedFilter = .all
                 searchQuery = ""
+                isAuthorsExpanded = false
+                isDiscussionExpanded = false
                 selectedRecordID = newID
+                paperVM.prefetchPDFIfNeeded(for: newID, silent: true)
+            }
+        }
+        .onChange(of: activeRecord?.id) { _, newActiveID in
+            isAuthorsExpanded = false
+            if let newActiveID, let rec = paperVM.record(id: newActiveID) {
+                isDiscussionExpanded = !rec.discussionMessages.isEmpty
+                paperVM.prefetchPDFIfNeeded(for: newActiveID, silent: true)
+            } else {
+                isDiscussionExpanded = false
+            }
+        }
+        .onChange(of: isDiscussionInputFocused) { _, focused in
+            if focused && !isDiscussionExpanded {
+                withAnimation(.spring(response: 0.25, dampingFraction: 0.86)) {
+                    isDiscussionExpanded = true
+                }
             }
         }
         .onReceive(NotificationCenter.default.publisher(for: AppDelegate.toggleSidebarNotification)) { note in
@@ -167,7 +199,7 @@ struct PaperDigestWorkspaceView: View {
             }
             Button("取消", role: .cancel) {}
         } message: {
-            Text("此操作将移除本地保存的所有论文解析卡片与个人批注（已归档至苹果备忘录或本地 .md 的文件不受影响）。")
+            Text("此操作将移除本地保存的所有论文解析卡片、缓存 PDF 与个人批注（已归档至苹果备忘录或本地 .md 的文件不受影响）。")
         }
     }
 
@@ -192,7 +224,7 @@ struct PaperDigestWorkspaceView: View {
                         }
                         let proposed = base + value.translation.width
                         if proposed >= 180 {
-                            let clamped = min(max(proposed, 235), 360)
+                            let clamped = min(max(proposed, 235), 315)
                             sidebarWidth = clamped
                             if !isStandaloneWindow {
                                 appViewModel.sidebarWidth = clamped
@@ -339,6 +371,9 @@ struct PaperDigestWorkspaceView: View {
 
     private var newPaperButton: some View {
         Button {
+            withAnimation(.easeInOut(duration: 0.15)) {
+                isURLBarCollapsed = false
+            }
             urlOrTextInput = ""
             isURLInputFocused = true
         } label: {
@@ -538,6 +573,20 @@ struct PaperDigestWorkspaceView: View {
                 }
             }
 
+            if paperVM.hasReadyPDF(record) || !record.digest.pdfURL.isEmpty {
+                Button {
+                    paperVM.openPDFForReading(record)
+                } label: {
+                    Label("打开原始论文 PDF", systemImage: "doc.richtext")
+                }
+            }
+
+            Button {
+                paperVM.chooseAndAttachLocalPDF(for: record.id)
+            } label: {
+                Label("关联本地原始 PDF…", systemImage: "paperclip")
+            }
+
             if !record.digest.sourceURL.isEmpty, let url = URL(string: record.digest.sourceURL) {
                 Button {
                     NSWorkspace.shared.open(url)
@@ -559,39 +608,48 @@ struct PaperDigestWorkspaceView: View {
         }
     }
 
-    // MARK: - Right Main Detail Column (Exact 24pt Left/Right Margin)
+    // MARK: - Right Main Detail Column (Exact 24pt Left/Right Margin + Viewport-Safe Dock Clamp)
 
     private var paperMainDetailColumn: some View {
-        VStack(alignment: .leading, spacing: 0) {
-            paperHeaderBar
-                .frame(height: 46)
+        GeometryReader { colGeo in
+            let maxAllowedThreadHeight = max(115, min(colGeo.size.height * 0.44, 380))
 
-            Rectangle()
-                .fill(palette.hairline)
-                .frame(height: 1)
+            VStack(alignment: .leading, spacing: 0) {
+                paperHeaderBar
+                    .frame(height: 46)
 
-            ScrollView(.vertical, showsIndicators: false) {
-                VStack(alignment: .leading, spacing: 18) {
-                    paperURLComposerBar
+                Rectangle()
+                    .fill(palette.hairline)
+                    .frame(height: 1)
 
-                    if let banner = paperVM.statusBanner {
-                        paperStatusBannerLine(banner)
+                ScrollView(.vertical, showsIndicators: false) {
+                    VStack(alignment: .leading, spacing: 16) {
+                        if !isURLBarCollapsed || activeRecord == nil || paperVM.isAnalyzing {
+                            paperURLComposerBar
+                        } else {
+                            collapsedURLBarPill
+                        }
+
+                        if let banner = paperVM.statusBanner {
+                            paperStatusBannerLine(banner)
+                        }
+
+                        if let record = activeRecord {
+                            paperInspectorCard(record: record)
+                        } else {
+                            emptyPaperPlaceholder
+                        }
                     }
-
-                    if let record = activeRecord {
-                        paperInspectorCard(record: record)
-                    } else {
-                        emptyPaperPlaceholder
-                    }
+                    .padding(.horizontal, 24)
+                    .padding(.top, 14)
+                    .padding(.bottom, 24)
                 }
-                .padding(.horizontal, 24)
-                .padding(.top, 16)
-                .padding(.bottom, 24)
-            }
 
-            if let record = activeRecord {
-                paperDiscussionDock(record: record)
+                if let record = activeRecord {
+                    paperDiscussionDock(record: record, maxThreadHeightBudget: maxAllowedThreadHeight)
+                }
             }
+            .frame(width: colGeo.size.width, height: colGeo.size.height, alignment: .topLeading)
         }
         .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
     }
@@ -797,17 +855,71 @@ struct PaperDigestWorkspaceView: View {
         .padding(.horizontal, 24)
     }
 
-    // MARK: - URL / Article Composer Bar (Exact match with MainWorkspaceView's sleekCommandComposerBar: 12pt H, 7pt V)
+    // MARK: - URL / Article / Local PDF Composer Bar (Collapsible + Drag & Drop PDF Support)
+
+    private var collapsedURLBarPill: some View {
+        HStack(alignment: .center, spacing: 8) {
+            Button {
+                withAnimation(.easeInOut(duration: 0.16)) {
+                    isURLBarCollapsed = false
+                }
+                isURLInputFocused = true
+            } label: {
+                HStack(spacing: 5) {
+                    Image(systemName: "link.badge.plus")
+                        .font(.system(size: 11, weight: .semibold))
+                        .foregroundStyle(palette.calendarTone)
+                    Text("解析新论文 / 公众号链接 / 拖入 PDF (⌘N)")
+                        .font(.system(size: 11.5, weight: .medium))
+                        .foregroundStyle(.secondary)
+                }
+                .padding(.horizontal, 10)
+                .frame(height: 26)
+                .background(
+                    RoundedRectangle(cornerRadius: 7, style: .continuous)
+                        .fill(palette.composerWellBg)
+                        .overlay(RoundedRectangle(cornerRadius: 7, style: .continuous).strokeBorder(palette.hairline, lineWidth: 1))
+                )
+            }
+            .buttonStyle(FullHitAreaButtonStyle(cornerRadius: 7))
+
+            Button {
+                Task {
+                    if let createdID = await paperVM.pasteClipboardAndAnalyze(
+                        preferredMode: appViewModel.aiProviderMode,
+                        speedProfile: appViewModel.aiSpeedProfile
+                    ) {
+                        selectedRecordID = createdID
+                    }
+                }
+            } label: {
+                HStack(spacing: 4) {
+                    Image(systemName: "doc.on.clipboard")
+                        .font(.system(size: 10.5, weight: .medium))
+                    Text("剪贴板一键解析")
+                        .font(.system(size: 11, weight: .medium))
+                }
+                .foregroundStyle(.secondary)
+                .padding(.horizontal, 9)
+                .frame(height: 26)
+                .background(RoundedRectangle(cornerRadius: 7, style: .continuous).fill(palette.subtleButtonBg))
+            }
+            .buttonStyle(FullHitAreaButtonStyle(cornerRadius: 7))
+            .disabled(paperVM.isAnalyzing)
+
+            Spacer()
+        }
+    }
 
     private var paperURLComposerBar: some View {
         HStack(alignment: .center, spacing: 10) {
-            Image(systemName: "link.badge.plus")
+            Image(systemName: isDropTargetingURLBar ? "arrow.down.doc.fill" : "link.badge.plus")
                 .font(.system(size: 13, weight: .medium))
                 .foregroundStyle(palette.calendarTone)
                 .padding(.leading, 2)
 
             TextField(
-                "粘贴微信公众号推送链接、arXiv / HuggingFace / GitHub 链接（或直接粘贴正文），按 ⌘↩ 深度拆解…",
+                "粘贴公众号推送、arXiv / HF / GitHub 链接（或直接拖入本地 PDF），按 ⌘↩ 深度拆解…",
                 text: $urlOrTextInput,
                 axis: .vertical
             )
@@ -861,28 +973,40 @@ struct PaperDigestWorkspaceView: View {
             .fixedSize()
             .disabled(paperVM.isAnalyzing)
 
-            Button {
-                let submitted = urlOrTextInput
-                Task {
-                    if let createdID = await paperVM.runAnalysis(
-                        rawInput: submitted,
-                        preferredMode: appViewModel.aiProviderMode,
-                        speedProfile: appViewModel.aiSpeedProfile
-                    ) {
-                        selectedRecordID = createdID
-                        if urlOrTextInput == submitted {
-                            urlOrTextInput = ""
-                        }
-                    }
-                }
-            } label: {
-                HStack(alignment: .center, spacing: 4) {
-                    if paperVM.isAnalyzing {
+            if paperVM.isAnalyzing {
+                Button {
+                    paperVM.cancelAnalysis()
+                } label: {
+                    HStack(alignment: .center, spacing: 5) {
                         ProgressView().controlSize(.mini)
-                        Text("解析中…")
+                        Text("取消解析")
                             .font(.system(size: 11, weight: .semibold))
                             .lineLimit(1)
-                    } else {
+                    }
+                    .foregroundStyle(palette.primaryActionFg)
+                    .padding(.horizontal, 11)
+                    .frame(height: 26)
+                    .background(RoundedRectangle(cornerRadius: 6, style: .continuous).fill(palette.primaryActionBg))
+                }
+                .buttonStyle(FullHitAreaButtonStyle())
+                .fixedSize()
+            } else {
+                Button {
+                    let submitted = urlOrTextInput
+                    Task {
+                        if let createdID = await paperVM.runAnalysis(
+                            rawInput: submitted,
+                            preferredMode: appViewModel.aiProviderMode,
+                            speedProfile: appViewModel.aiSpeedProfile
+                        ) {
+                            selectedRecordID = createdID
+                            if urlOrTextInput == submitted {
+                                urlOrTextInput = ""
+                            }
+                        }
+                    }
+                } label: {
+                    HStack(alignment: .center, spacing: 4) {
                         Text("解析论文")
                             .font(.system(size: 11.5, weight: .semibold))
                             .lineLimit(1)
@@ -890,19 +1014,34 @@ struct PaperDigestWorkspaceView: View {
                             .font(.system(size: 10))
                             .opacity(0.75)
                     }
+                    .foregroundStyle(palette.primaryActionFg)
+                    .padding(.horizontal, 12)
+                    .frame(height: 26)
+                    .background(
+                        RoundedRectangle(cornerRadius: 6, style: .continuous)
+                            .fill(palette.primaryActionBg)
+                    )
                 }
-                .foregroundStyle(palette.primaryActionFg)
-                .padding(.horizontal, 12)
-                .frame(height: 26)
-                .background(
-                    RoundedRectangle(cornerRadius: 6, style: .continuous)
-                        .fill(palette.primaryActionBg)
-                )
+                .buttonStyle(FullHitAreaButtonStyle())
+                .fixedSize()
+                .keyboardShortcut(.return, modifiers: (isNotesEditorFocused || isDiscussionInputFocused) ? [.command, .option, .shift] : [.command])
             }
-            .buttonStyle(FullHitAreaButtonStyle())
-            .fixedSize()
-            .disabled(paperVM.isAnalyzing)
-            .keyboardShortcut(.return, modifiers: (isNotesEditorFocused || isDiscussionInputFocused) ? [.command, .option, .shift] : [.command])
+
+            if activeRecord != nil && urlOrTextInput.isEmpty && !paperVM.isAnalyzing {
+                Button {
+                    isURLInputFocused = false
+                    withAnimation(.easeInOut(duration: 0.16)) {
+                        isURLBarCollapsed = true
+                    }
+                } label: {
+                    Image(systemName: "chevron.up")
+                        .font(.system(size: 10, weight: .bold))
+                        .foregroundStyle(.tertiary)
+                        .frame(width: 22, height: 26)
+                }
+                .buttonStyle(FullHitAreaButtonStyle())
+                .help("收起顶部输入栏以获得更大阅读视野")
+            }
         }
         .padding(.horizontal, 12)
         .padding(.vertical, 7)
@@ -911,9 +1050,24 @@ struct PaperDigestWorkspaceView: View {
                 .fill(palette.composerWellBg)
                 .overlay(
                     RoundedRectangle(cornerRadius: 9, style: .continuous)
-                        .strokeBorder(palette.hairline, lineWidth: 1)
+                        .strokeBorder(isDropTargetingURLBar ? palette.calendarTone : palette.hairline, lineWidth: isDropTargetingURLBar ? 1.5 : 1)
                 )
         )
+        .onDrop(of: [.pdf, .fileURL], isTargeted: $isDropTargetingURLBar) { providers in
+            handleDroppedPDFProviders(providers) { pdfURL in
+                Task { @MainActor in
+                    urlOrTextInput = pdfURL.path
+                    if let createdID = await paperVM.runAnalysis(
+                        rawInput: pdfURL.path,
+                        preferredMode: appViewModel.aiProviderMode,
+                        speedProfile: appViewModel.aiSpeedProfile
+                    ) {
+                        selectedRecordID = createdID
+                        urlOrTextInput = ""
+                    }
+                }
+            }
+        }
     }
 
     private func paperStatusBannerLine(_ text: String) -> some View {
@@ -981,7 +1135,7 @@ struct PaperDigestWorkspaceView: View {
         return VStack(alignment: .leading, spacing: 16) {
             // Module 1: Paper Identity Header + Direct Links + Export Toolbar
             VStack(alignment: .leading, spacing: 11) {
-                // Row 1: Left = Alias & Venue (26pt height) | Right = Uniform 26pt Action Buttons (Zero baseline shift!)
+                // Row 1: Left = Alias & Venue (26pt height) | Right = Uniform 26pt Action Buttons (Zero baseline shift & narrow-window safe!)
                 HStack(alignment: .center, spacing: 8) {
                     HStack(alignment: .center, spacing: 6) {
                         if !d.shortAlias.isEmpty {
@@ -989,7 +1143,8 @@ struct PaperDigestWorkspaceView: View {
                                 .font(.system(size: 11, weight: .bold, design: .monospaced))
                                 .foregroundStyle(palette.calendarTone)
                                 .lineLimit(1)
-                                .fixedSize()
+                                .truncationMode(.tail)
+                                .frame(maxWidth: 140)
                                 .padding(.horizontal, 9)
                                 .frame(height: 26)
                                 .background(
@@ -998,8 +1153,8 @@ struct PaperDigestWorkspaceView: View {
                                 )
                         }
 
-                        if !d.venueAndDate.isEmpty {
-                            Text(d.venueAndDate)
+                        if !d.compactVenueBadgeText.isEmpty {
+                            Text(d.compactVenueBadgeText)
                                 .font(.system(size: 10.5, weight: .medium, design: .monospaced))
                                 .foregroundStyle(.secondary)
                                 .lineLimit(1)
@@ -1010,13 +1165,14 @@ struct PaperDigestWorkspaceView: View {
                                     RoundedRectangle(cornerRadius: 6, style: .continuous)
                                         .fill(palette.subtleButtonBg)
                                 )
+                                .help(d.venueAndDate)
                         }
                     }
 
                     Spacer(minLength: 8)
 
                     // Right Action Toolbar: Every button/menu is strictly 26pt tall with identical corner radius!
-                    HStack(alignment: .center, spacing: 6) {
+                    HStack(alignment: .center, spacing: 5) {
                         Button {
                             withAnimation(.spring(response: 0.26, dampingFraction: 0.86)) {
                                 isDiscussionExpanded = true
@@ -1032,7 +1188,7 @@ struct PaperDigestWorkspaceView: View {
                                     .lineLimit(1)
                             }
                             .foregroundStyle(palette.calendarTone)
-                            .padding(.horizontal, 10)
+                            .padding(.horizontal, 9)
                             .frame(height: 26)
                             .background(
                                 RoundedRectangle(cornerRadius: 6, style: .continuous)
@@ -1041,7 +1197,7 @@ struct PaperDigestWorkspaceView: View {
                         }
                         .buttonStyle(FullHitAreaButtonStyle(cornerRadius: 6))
                         .fixedSize()
-                        .help("展开下方讨论面板，基于当前结构化卡片与 Cursor 继续深入问答")
+                        .help("展开下方讨论面板，结合结构化卡片与原始 PDF 全文深入问答")
 
                         Button {
                             paperVM.toggleStar(record.id)
@@ -1058,7 +1214,7 @@ struct PaperDigestWorkspaceView: View {
                         Button {
                             paperVM.copyMarkdownToClipboard(record)
                         } label: {
-                            HStack(spacing: 4) {
+                            HStack(spacing: 3.5) {
                                 Image(systemName: "doc.on.doc")
                                     .font(.system(size: 10, weight: .semibold))
                                 Text("复制 MD")
@@ -1066,22 +1222,20 @@ struct PaperDigestWorkspaceView: View {
                                     .lineLimit(1)
                             }
                             .foregroundStyle(.secondary)
-                            .padding(.horizontal, 10)
+                            .padding(.horizontal, 9)
                             .frame(height: 26)
                             .background(RoundedRectangle(cornerRadius: 6, style: .continuous).fill(palette.subtleButtonBg))
                         }
                         .buttonStyle(FullHitAreaButtonStyle(cornerRadius: 6))
                         .fixedSize()
-                        .help("一键复制带 YAML Frontmatter 的结构化 Markdown")
+                        .help("一键复制带 YAML Frontmatter 与讨论记录的结构化 Markdown")
 
-                        // Menu styled via .menuStyle(.button) + .buttonStyle(FullHitAreaButtonStyle) + .menuIndicator(.hidden)
-                        // so its background, border, height (26pt), and text baseline match `复制 MD` 100.0% pixel-for-pixel!
                         Menu {
                             Button {
                                 paperVM.exportMarkdownToLocalFolder(record, forceChooseFolder: false)
                             } label: {
                                 if let savedDir = paperVM.savedExportDirectoryPath {
-                                    Label("快速导出至：\((savedDir as NSString).lastPathComponent)", systemImage: "arrow.down.doc")
+                                    Label("快速保存 .md 至：\((savedDir as NSString).lastPathComponent)", systemImage: "arrow.down.doc")
                                 } else {
                                     Label("导出 .md 文件到本地目录 / Obsidian…", systemImage: "arrow.down.doc")
                                 }
@@ -1095,25 +1249,22 @@ struct PaperDigestWorkspaceView: View {
                                 }
                             }
                         } label: {
-                            HStack(spacing: 4) {
+                            HStack(spacing: 2.5) {
                                 Image(systemName: "arrow.down.doc")
-                                    .font(.system(size: 10, weight: .semibold))
-                                Text("存为 .md")
-                                    .font(.system(size: 11, weight: .medium))
-                                    .lineLimit(1)
+                                    .font(.system(size: 10.5, weight: .semibold))
                                 Image(systemName: "chevron.down")
-                                    .font(.system(size: 7.5, weight: .bold))
+                                    .font(.system(size: 7, weight: .bold))
                                     .opacity(0.65)
                             }
                             .foregroundStyle(.secondary)
-                            .padding(.horizontal, 10)
-                            .frame(height: 26)
+                            .frame(width: 30, height: 26)
                             .background(RoundedRectangle(cornerRadius: 6, style: .continuous).fill(palette.subtleButtonBg))
                         }
                         .menuStyle(.button)
                         .buttonStyle(FullHitAreaButtonStyle(cornerRadius: 6))
                         .menuIndicator(.hidden)
                         .fixedSize()
+                        .help("导出为本地 .md 文件（支持绑定 Obsidian 目录）")
 
                         Button {
                             Task { await paperVM.archiveToAppleNotes(record) }
@@ -1222,8 +1373,26 @@ struct PaperDigestWorkspaceView: View {
                     if !d.paperURL.isEmpty {
                         externalLinkPill(label: "论文主页 / arXiv", icon: "doc.text", urlString: d.paperURL, tone: palette.calendarTone)
                     }
-                    if !d.pdfURL.isEmpty {
-                        externalLinkPill(label: "PDF 直达", icon: "arrow.up.right.square", urlString: d.pdfURL, tone: palette.calendarTone)
+                    if paperVM.hasReadyPDF(record) || !d.pdfURL.isEmpty {
+                        Button {
+                            paperVM.openPDFForReading(record)
+                        } label: {
+                            HStack(spacing: 4) {
+                                Image(systemName: paperVM.hasReadyPDF(record) ? "doc.richtext.fill" : "arrow.up.right.square")
+                                    .font(.system(size: 10, weight: .semibold))
+                                Text(paperVM.hasReadyPDF(record) ? "原始 PDF (已缓存)" : "PDF 直达")
+                                    .font(.system(size: 10.5, weight: .semibold))
+                                    .lineLimit(1)
+                                Image(systemName: "arrow.up.right")
+                                    .font(.system(size: 8, weight: .bold))
+                            }
+                            .foregroundStyle(palette.calendarTone)
+                            .padding(.horizontal, 9)
+                            .frame(height: 24)
+                            .background(RoundedRectangle(cornerRadius: 5.5, style: .continuous).fill(palette.calendarTone.opacity(0.11)))
+                        }
+                        .buttonStyle(FullHitAreaButtonStyle(cornerRadius: 5.5))
+                        .help(record.cachedPDFPath ?? d.pdfURL)
                     }
                     if !d.codeURL.isEmpty {
                         externalLinkPill(label: "开源代码 / 模型", icon: "chevron.left.forwardslash.chevron.right", urlString: d.codeURL, tone: palette.committedTone)
@@ -1425,21 +1594,29 @@ struct PaperDigestWorkspaceView: View {
         .id(record.id)
     }
 
-    // MARK: - Bottom-Docked Cursor Discussion Panel (Independent of Upper Card Scroll!)
+    // MARK: - Bottom-Docked Paper Discussion Panel (Grounded in Card + Original PDF, Independent Scroll & Draggable Height!)
 
     private static let quickDiscussionPrompts: [String] = [
-        "用直白的例子解释核心方法与关键公式",
-        "这项工作的实验设计有哪些潜在漏洞或盲区？",
-        "相比现有主流基线，它最核心的收益与代价取舍是什么？",
-        "这篇论文有哪些思路值得迁移到其他任务？"
+        "结合原论文展开讲讲核心模块的具体结构与训练目标",
+        "原论文的消融实验与超参数设置（学习率/数据/算力）是什么？",
+        "这项工作的实验设计有哪些潜在漏洞或评测盲区？",
+        "相比现有主流基线，它最核心的收益与代价取舍是什么？"
     ]
 
+    private func discussionDraftBinding(for recordID: UUID) -> Binding<String> {
+        Binding(
+            get: { paperVM.discussionDraft(for: recordID) },
+            set: { paperVM.setDiscussionDraft($0, for: recordID) }
+        )
+    }
+
     private func submitDiscussionQuestion(for record: PaperDigestRecord, presetQuestion: String? = nil) {
-        let questionToSend = (presetQuestion ?? discussionInputText).trimmingCharacters(in: .whitespacesAndNewlines)
+        let currentDraft = paperVM.discussionDraft(for: record.id)
+        let questionToSend = (presetQuestion ?? currentDraft).trimmingCharacters(in: .whitespacesAndNewlines)
         guard !questionToSend.isEmpty, !paperVM.isDiscussing(record.id) else { return }
 
         if presetQuestion == nil {
-            discussionInputText = ""
+            paperVM.setDiscussionDraft("", for: record.id)
         }
         withAnimation(.spring(response: 0.26, dampingFraction: 0.86)) {
             isDiscussionExpanded = true
@@ -1447,47 +1624,97 @@ struct PaperDigestWorkspaceView: View {
 
         let targetID = record.id
         Task {
-            let ok = await paperVM.askFollowUpQuestion(
+            await paperVM.askFollowUpQuestion(
                 recordID: targetID,
                 question: questionToSend,
                 preferredMode: appViewModel.aiProviderMode,
                 speedProfile: appViewModel.aiSpeedProfile
             )
-            if !ok && presetQuestion == nil && discussionInputText.isEmpty {
-                discussionInputText = questionToSend
-            }
         }
     }
 
-    private func paperDiscussionDock(record: PaperDigestRecord) -> some View {
+    private func paperDiscussionDock(record: PaperDigestRecord, maxThreadHeightBudget: CGFloat) -> some View {
         let isBusy = paperVM.isDiscussing(record.id)
+        let isPDFLoading = paperVM.isLoadingPDF(record.id)
+        let isPDFReady = paperVM.hasReadyPDF(record)
         let hasMessages = !record.discussionMessages.isEmpty
         let showThreadArea = isDiscussionExpanded || isBusy
+        let effectiveThreadHeight = min(max(discussionThreadHeight, 105), maxThreadHeightBudget)
+        let draftBinding = discussionDraftBinding(for: record.id)
+        let currentDraftText = draftBinding.wrappedValue
 
         return VStack(alignment: .leading, spacing: 0) {
-            Rectangle()
-                .fill(palette.hairline)
-                .frame(height: 1)
+            // Draggable Horizontal Resize Handle (Double-click to toggle expand/collapse)
+            ZStack {
+                Rectangle()
+                    .fill(isHoveringDiscussionDivider ? Color.accentColor.opacity(0.45) : palette.hairline)
+                    .frame(height: isHoveringDiscussionDivider ? 2 : 1)
 
-            VStack(alignment: .leading, spacing: 10) {
-                // Header Strip (Visible when expanded or when prior messages exist)
-                if showThreadArea || hasMessages {
+                if showThreadArea {
+                    Capsule()
+                        .fill(isHoveringDiscussionDivider ? Color.accentColor.opacity(0.65) : palette.hairline.opacity(0.85))
+                        .frame(width: 30, height: 3)
+                }
+            }
+            .frame(height: 7)
+            .contentShape(Rectangle())
+            .onHover { hovering in
+                isHoveringDiscussionDivider = hovering
+                if hovering {
+                    NSCursor.resizeUpDown.set()
+                } else {
+                    NSCursor.arrow.set()
+                }
+            }
+            .onTapGesture(count: 2) {
+                withAnimation(.spring(response: 0.25, dampingFraction: 0.86)) {
+                    isDiscussionExpanded.toggle()
+                }
+            }
+            .gesture(
+                DragGesture(minimumDistance: 2, coordinateSpace: .global)
+                    .onChanged { value in
+                        if !showThreadArea {
+                            isDiscussionExpanded = true
+                        }
+                        let base = dragStartDiscussionHeight ?? effectiveThreadHeight
+                        if dragStartDiscussionHeight == nil {
+                            dragStartDiscussionHeight = base
+                        }
+                        // Dragging UP (negative translation.height) increases dock height
+                        let proposed = base - value.translation.height
+                        if proposed >= 75 {
+                            discussionThreadHeight = min(max(proposed, 105), maxThreadHeightBudget)
+                        }
+                    }
+                    .onEnded { value in
+                        let base = dragStartDiscussionHeight ?? effectiveThreadHeight
+                        dragStartDiscussionHeight = nil
+                        if base - value.translation.height < 75 && !isBusy {
+                            withAnimation(.spring(response: 0.25, dampingFraction: 0.86)) {
+                                isDiscussionExpanded = false
+                            }
+                        }
+                    }
+            )
+
+            VStack(alignment: .leading, spacing: 9) {
+                // Header Strip (Visible when expanded, loading PDF, or when prior messages exist)
+                if showThreadArea || hasMessages || isPDFLoading {
                     HStack(alignment: .center, spacing: 8) {
                         Image(systemName: "bubble.left.and.bubble.right.fill")
                             .font(.system(size: 11, weight: .semibold))
                             .foregroundStyle(palette.calendarTone)
                             .frame(width: 16, alignment: .center)
 
-                        Text("与 Cursor 继续讨论")
-                            .font(.system(size: 12, weight: .bold))
+                        Text("继续讨论")
+                            .font(.system(size: 12.5, weight: .bold))
                             .foregroundStyle(.primary)
 
-                        Text("· 基于当前论文结构化卡片直接作答")
-                            .font(.system(size: 10.5))
-                            .foregroundStyle(.tertiary)
-                            .lineLimit(1)
+                        // Live Original PDF Grounding Status Badge / Action Pill
+                        pdfGroundingStatusBadge(for: record, isPDFLoading: isPDFLoading, isPDFReady: isPDFReady)
 
-                        Spacer()
+                        Spacer(minLength: 4)
 
                         if hasMessages {
                             Button {
@@ -1501,7 +1728,6 @@ struct PaperDigestWorkspaceView: View {
                                     .background(RoundedRectangle(cornerRadius: 5, style: .continuous).fill(palette.subtleButtonBg))
                             }
                             .buttonStyle(FullHitAreaButtonStyle(cornerRadius: 5))
-                            .disabled(isBusy)
                         }
 
                         Button {
@@ -1510,7 +1736,8 @@ struct PaperDigestWorkspaceView: View {
                             }
                         } label: {
                             HStack(spacing: 3) {
-                                Text(showThreadArea ? "收起" : "展开 (\(record.discussionMessages.filter { $0.role == .user }.count))")
+                                let turnCount = record.discussionMessages.filter { $0.role == .user }.count
+                                Text(showThreadArea ? "收起" : (turnCount > 0 ? "展开 (\(turnCount))" : "展开"))
                                     .font(.system(size: 10.5, weight: .medium))
                                 Image(systemName: showThreadArea ? "chevron.down" : "chevron.up")
                                     .font(.system(size: 8.5, weight: .bold))
@@ -1538,6 +1765,7 @@ struct PaperDigestWorkspaceView: View {
                                         Text(preset)
                                             .font(.system(size: 11, weight: .medium))
                                             .lineLimit(1)
+                                            .truncationMode(.tail)
                                     }
                                     .foregroundStyle(palette.calendarTone)
                                     .padding(.horizontal, 10)
@@ -1567,9 +1795,13 @@ struct PaperDigestWorkspaceView: View {
                                         HStack(alignment: .center, spacing: 8) {
                                             ProgressView().controlSize(.mini)
                                                 .frame(width: 16)
-                                            Text("Cursor 正在结合上方结构化卡片思考回答…")
-                                                .font(.system(size: 12))
-                                                .foregroundStyle(.secondary)
+                                            Text(
+                                                isPDFLoading
+                                                    ? "正在下载并提取原始论文 PDF 全文，随后作答…"
+                                                    : (isPDFReady ? "正在检索结构化卡片与原始 PDF 全文思考作答…" : "正在结合结构化卡片思考作答…")
+                                            )
+                                            .font(.system(size: 12))
+                                            .foregroundStyle(.secondary)
                                         }
                                         .padding(.vertical, 4)
                                         .id("discussion-thinking-anchor")
@@ -1578,7 +1810,7 @@ struct PaperDigestWorkspaceView: View {
                                 .frame(maxWidth: .infinity, alignment: .leading)
                                 .padding(.trailing, 4)
                             }
-                            .frame(minHeight: 90, maxHeight: 205)
+                            .frame(minHeight: min(92, effectiveThreadHeight), maxHeight: effectiveThreadHeight)
                             .onAppear {
                                 if isBusy {
                                     proxy.scrollTo("discussion-thinking-anchor", anchor: .bottom)
@@ -1599,40 +1831,39 @@ struct PaperDigestWorkspaceView: View {
                     }
                 }
 
-                // Always-Ready Docked Input Bar (Exact 24pt Horizontal Alignment with Upper Workspace!)
+                // Always-Ready Docked Input Bar (Exact 24pt Horizontal Alignment with Upper Workspace + Native First-Click Caret!)
                 HStack(alignment: .center, spacing: 10) {
-                    Image(systemName: "sparkles")
+                    Image(systemName: isDropTargetingDiscussion ? "arrow.down.doc.fill" : "sparkles")
                         .font(.system(size: 12.5, weight: .semibold))
                         .foregroundStyle(palette.calendarTone)
                         .padding(.leading, 2)
 
                     TextField(
-                        "围绕「\(record.digest.shortAlias.isEmpty ? "当前论文" : record.digest.shortAlias)」继续向 Cursor 提问（基于结构化信息作答，按 ↩ 发送）…",
-                        text: $discussionInputText
+                        isPDFReady
+                            ? "围绕「\(record.digest.shortAlias.isEmpty ? "当前论文" : record.digest.shortAlias)」追问公式、实验表或实现细节（已结合原 PDF，按 ↩ 发送）…"
+                            : "围绕「\(record.digest.shortAlias.isEmpty ? "当前论文" : record.digest.shortAlias)」继续追问方法细节或局限性（按 ↩ 发送，支持拖入 PDF）…",
+                        text: draftBinding
                     )
                     .textFieldStyle(.plain)
                     .font(.system(size: 12.5))
                     .focused($isDiscussionInputFocused)
-                    .onTapGesture {
-                        if !isDiscussionExpanded {
-                            withAnimation(.spring(response: 0.25, dampingFraction: 0.86)) {
-                                isDiscussionExpanded = true
-                            }
-                        }
-                    }
                     .onSubmit {
                         submitDiscussionQuestion(for: record)
                     }
 
-                    if !discussionInputText.isEmpty {
+                    if !currentDraftText.isEmpty {
                         Button {
-                            discussionInputText = ""
+                            paperVM.setDiscussionDraft("", for: record.id)
                         } label: {
                             Image(systemName: "xmark.circle.fill")
                                 .font(.system(size: 11.5))
                                 .foregroundStyle(.tertiary)
                         }
                         .buttonStyle(FullHitAreaButtonStyle())
+                    }
+
+                    if !showThreadArea && !hasMessages {
+                        pdfCompactInputBadge(for: record, isPDFLoading: isPDFLoading, isPDFReady: isPDFReady)
                     }
 
                     Menu {
@@ -1643,11 +1874,17 @@ struct PaperDigestWorkspaceView: View {
                                 }
                             }
                         }
+                        Divider()
+                        Button {
+                            paperVM.chooseAndAttachLocalPDF(for: record.id)
+                        } label: {
+                            Label(isPDFReady ? "更换关联的本地 PDF…" : "关联本地原始 PDF…", systemImage: "paperclip")
+                        }
                     } label: {
                         HStack(spacing: 4) {
                             Image(systemName: "lightbulb")
                                 .font(.system(size: 10.5, weight: .semibold))
-                            Text("追问灵感")
+                            Text("灵感")
                                 .font(.system(size: 11, weight: .medium))
                                 .lineLimit(1)
                             Image(systemName: "chevron.up")
@@ -1665,36 +1902,50 @@ struct PaperDigestWorkspaceView: View {
                     .fixedSize()
                     .disabled(isBusy)
 
-                    Button {
-                        submitDiscussionQuestion(for: record)
-                    } label: {
-                        let canSend = !discussionInputText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty && !isBusy
-                        HStack(spacing: 4) {
-                            if isBusy {
-                                ProgressView().controlSize(.mini)
-                                Text("思考中…")
+                    if isBusy {
+                        Button {
+                            paperVM.cancelDiscussion(recordID: record.id)
+                        } label: {
+                            HStack(spacing: 4) {
+                                Image(systemName: "stop.fill")
+                                    .font(.system(size: 9, weight: .bold))
+                                Text("停止")
                                     .font(.system(size: 11, weight: .semibold))
                                     .lineLimit(1)
-                            } else {
+                            }
+                            .foregroundStyle(Color.white)
+                            .padding(.horizontal, 11)
+                            .frame(height: 25)
+                            .background(RoundedRectangle(cornerRadius: 6, style: .continuous).fill(palette.urgentTone.opacity(0.88)))
+                        }
+                        .buttonStyle(FullHitAreaButtonStyle(cornerRadius: 6))
+                        .fixedSize()
+                        .help("立即停止本次回答并恢复提问草稿")
+                    } else {
+                        let canSend = !currentDraftText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+                        Button {
+                            submitDiscussionQuestion(for: record)
+                        } label: {
+                            HStack(spacing: 4) {
                                 Text("提问")
                                     .font(.system(size: 11.5, weight: .semibold))
                                     .lineLimit(1)
                                 Image(systemName: "arrow.up.circle.fill")
                                     .font(.system(size: 11.5))
                             }
+                            .foregroundStyle(canSend ? Color.white : Color.secondary)
+                            .padding(.horizontal, 11)
+                            .frame(height: 25)
+                            .background(
+                                RoundedRectangle(cornerRadius: 6, style: .continuous)
+                                    .fill(canSend ? palette.calendarTone : palette.subtleButtonBg)
+                            )
                         }
-                        .foregroundStyle(canSend || isBusy ? Color.white : Color.secondary)
-                        .padding(.horizontal, 11)
-                        .frame(height: 25)
-                        .background(
-                            RoundedRectangle(cornerRadius: 6, style: .continuous)
-                                .fill(canSend || isBusy ? palette.calendarTone : palette.subtleButtonBg)
-                        )
+                        .buttonStyle(FullHitAreaButtonStyle(cornerRadius: 6))
+                        .fixedSize()
+                        .disabled(!canSend)
+                        .keyboardShortcut(.return, modifiers: isDiscussionInputFocused ? [.command] : [.command, .control, .option])
                     }
-                    .buttonStyle(FullHitAreaButtonStyle(cornerRadius: 6))
-                    .fixedSize()
-                    .disabled(discussionInputText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty || isBusy)
-                    .keyboardShortcut(.return, modifiers: isDiscussionInputFocused ? [.command] : [.command, .control, .option])
                 }
                 .padding(.horizontal, 12)
                 .padding(.vertical, 6.5)
@@ -1703,46 +1954,177 @@ struct PaperDigestWorkspaceView: View {
                         .fill(palette.composerWellBg)
                         .overlay(
                             RoundedRectangle(cornerRadius: 9, style: .continuous)
-                                .strokeBorder(isDiscussionInputFocused ? palette.calendarTone.opacity(0.55) : palette.hairline, lineWidth: 1)
+                                .strokeBorder(
+                                    isDropTargetingDiscussion
+                                        ? palette.committedTone
+                                        : (isDiscussionInputFocused ? palette.calendarTone.opacity(0.55) : palette.hairline),
+                                    lineWidth: isDropTargetingDiscussion ? 1.5 : 1
+                                )
                         )
                 )
             }
             .padding(.horizontal, 24)
-            .padding(.top, 10)
+            .padding(.top, 6)
             .padding(.bottom, 12)
             .background(palette.mainCanvasBg)
+        }
+        .onDrop(of: [.pdf, .fileURL], isTargeted: $isDropTargetingDiscussion) { providers in
+            handleDroppedPDFProviders(providers) { pdfURL in
+                Task { @MainActor in
+                    paperVM.attachLocalPDF(url: pdfURL, for: record.id)
+                }
+            }
+        }
+    }
+
+    @ViewBuilder
+    private func pdfGroundingStatusBadge(for record: PaperDigestRecord, isPDFLoading: Bool, isPDFReady: Bool) -> some View {
+        if isPDFLoading {
+            HStack(spacing: 4) {
+                ProgressView().controlSize(.mini)
+                Text("正在加载原始 PDF…")
+                    .font(.system(size: 10.5, weight: .medium))
+                    .foregroundStyle(.secondary)
+                    .lineLimit(1)
+            }
+            .padding(.horizontal, 8)
+            .frame(height: 21)
+            .background(RoundedRectangle(cornerRadius: 5, style: .continuous).fill(palette.subtleButtonBg))
+        } else if isPDFReady {
+            Menu {
+                Button {
+                    paperVM.openPDFForReading(record)
+                } label: {
+                    Label("在预览中打开缓存的原始 PDF", systemImage: "doc.richtext")
+                }
+                Button {
+                    paperVM.chooseAndAttachLocalPDF(for: record.id)
+                } label: {
+                    Label("更换关联的本地 PDF…", systemImage: "paperclip")
+                }
+            } label: {
+                HStack(spacing: 4) {
+                    Image(systemName: "doc.text.fill")
+                        .font(.system(size: 9.5, weight: .semibold))
+                    let pagesLabel = record.cachedPDFPageCount.map { " (\($0)页)" } ?? ""
+                    Text("已结合原始 PDF\(pagesLabel)")
+                        .font(.system(size: 10.5, weight: .semibold))
+                        .lineLimit(1)
+                }
+                .foregroundStyle(palette.committedTone)
+                .padding(.horizontal, 8)
+                .frame(height: 21)
+                .background(
+                    RoundedRectangle(cornerRadius: 5, style: .continuous)
+                        .fill(palette.committedTone.opacity(0.11))
+                )
+            }
+            .menuStyle(.button)
+            .buttonStyle(FullHitAreaButtonStyle(cornerRadius: 5))
+            .menuIndicator(.hidden)
+            .fixedSize()
+            .help("后续追问将自动检索整份原始 PDF 全文并标注页码出处；点击可打开 PDF")
+        } else if paperVM.canAutoFetchRemotePDF(record) {
+            Button {
+                paperVM.prefetchPDFIfNeeded(for: record.id, silent: false)
+            } label: {
+                HStack(spacing: 4) {
+                    Image(systemName: "arrow.down.doc")
+                        .font(.system(size: 9.5, weight: .semibold))
+                    Text("加载原始 PDF 全文")
+                        .font(.system(size: 10.5, weight: .medium))
+                        .lineLimit(1)
+                }
+                .foregroundStyle(palette.calendarTone)
+                .padding(.horizontal, 8)
+                .frame(height: 21)
+                .background(RoundedRectangle(cornerRadius: 5, style: .continuous).fill(palette.calendarTone.opacity(0.10)))
+            }
+            .buttonStyle(FullHitAreaButtonStyle(cornerRadius: 5))
+            .fixedSize()
+        } else {
+            Button {
+                paperVM.chooseAndAttachLocalPDF(for: record.id)
+            } label: {
+                HStack(spacing: 4) {
+                    Image(systemName: "paperclip")
+                        .font(.system(size: 9.5, weight: .semibold))
+                    Text("关联本地 PDF…")
+                        .font(.system(size: 10.5, weight: .medium))
+                        .lineLimit(1)
+                }
+                .foregroundStyle(.secondary)
+                .padding(.horizontal, 8)
+                .frame(height: 21)
+                .background(RoundedRectangle(cornerRadius: 5, style: .continuous).fill(palette.subtleButtonBg))
+            }
+            .buttonStyle(FullHitAreaButtonStyle(cornerRadius: 5))
+            .fixedSize()
+            .help("当前链接不含公开 PDF，可手动关联或拖入本地 PDF 文件以结合全文讨论")
+        }
+    }
+
+    @ViewBuilder
+    private func pdfCompactInputBadge(for record: PaperDigestRecord, isPDFLoading: Bool, isPDFReady: Bool) -> some View {
+        if isPDFReady {
+            Button {
+                paperVM.openPDFForReading(record)
+            } label: {
+                HStack(spacing: 3.5) {
+                    Image(systemName: "doc.text.fill")
+                        .font(.system(size: 9.5, weight: .semibold))
+                    Text("PDF\(record.cachedPDFPageCount.map { " \($0)p" } ?? "")")
+                        .font(.system(size: 10.5, weight: .semibold, design: .monospaced))
+                        .lineLimit(1)
+                }
+                .foregroundStyle(palette.committedTone)
+                .padding(.horizontal, 7)
+                .frame(height: 25)
+                .background(RoundedRectangle(cornerRadius: 6, style: .continuous).fill(palette.committedTone.opacity(0.11)))
+            }
+            .buttonStyle(FullHitAreaButtonStyle(cornerRadius: 6))
+            .fixedSize()
+            .help("已挂载原始 PDF 全文（点击打开 PDF）")
+        } else if !isPDFLoading && !paperVM.canAutoFetchRemotePDF(record) {
+            Button {
+                paperVM.chooseAndAttachLocalPDF(for: record.id)
+            } label: {
+                Image(systemName: "paperclip")
+                    .font(.system(size: 11, weight: .semibold))
+                    .foregroundStyle(.secondary)
+                    .frame(width: 25, height: 25)
+                    .background(RoundedRectangle(cornerRadius: 6, style: .continuous).fill(palette.subtleButtonBg))
+            }
+            .buttonStyle(FullHitAreaButtonStyle(cornerRadius: 6))
+            .help("关联本地原始 PDF 以结合全文作答")
         }
     }
 
     private func discussionMessageRow(_ msg: PaperDiscussionMessage) -> some View {
         let isUser = (msg.role == .user)
 
-        return HStack(alignment: .top, spacing: 8) {
-            Text(isUser ? "提问" : "Cursor")
+        return HStack(alignment: .top, spacing: 9) {
+            Text(isUser ? "提问" : "解答")
                 .font(.system(size: 9.5, weight: .bold, design: .rounded))
                 .foregroundStyle(isUser ? palette.calendarTone : palette.committedTone)
-                .padding(.horizontal, 6)
+                .padding(.horizontal, 6.5)
                 .frame(height: 19)
                 .background(
                     RoundedRectangle(cornerRadius: 4.5, style: .continuous)
                         .fill((isUser ? palette.calendarTone : palette.committedTone).opacity(0.12))
                 )
                 .fixedSize()
-                .padding(.top, 1)
+                .padding(.top, 1.5)
 
-            Text(Self.renderChatMarkdown(msg.content))
-                .font(.system(size: 12.5, weight: isUser ? .semibold : .regular))
-                .foregroundStyle(Color.primary.opacity(isUser ? 1.0 : 0.92))
-                .lineSpacing(4)
+            discussionMessageContentView(msg.content, isUser: isUser)
                 .frame(maxWidth: .infinity, alignment: .leading)
-                .textSelection(.enabled)
 
             if !isUser {
                 Button {
                     NSPasteboard.general.clearContents()
                     NSPasteboard.general.setString(msg.content, forType: .string)
                     paperVM.isErrorBanner = false
-                    paperVM.statusBanner = "📋 已复制该条 Cursor 讨论回答"
+                    paperVM.statusBanner = "📋 已复制该条讨论解答"
                 } label: {
                     Image(systemName: "doc.on.doc")
                         .font(.system(size: 10))
@@ -1751,11 +2133,11 @@ struct PaperDigestWorkspaceView: View {
                         .background(RoundedRectangle(cornerRadius: 5, style: .continuous).fill(palette.subtleButtonBg))
                 }
                 .buttonStyle(FullHitAreaButtonStyle(cornerRadius: 5))
-                .help("复制此条回答")
+                .help("复制此条解答")
             }
         }
         .padding(.horizontal, 12)
-        .padding(.vertical, 9)
+        .padding(.vertical, 9.5)
         .background(
             RoundedRectangle(cornerRadius: 8, style: .continuous)
                 .fill(isUser ? palette.calendarTone.opacity(0.055) : palette.composerWellBg)
@@ -1764,6 +2146,165 @@ struct PaperDigestWorkspaceView: View {
                         .strokeBorder(isUser ? palette.calendarTone.opacity(0.16) : palette.hairline, lineWidth: 1)
                 )
         )
+    }
+
+    @ViewBuilder
+    private func discussionMessageContentView(_ rawContent: String, isUser: Bool) -> some View {
+        if isUser {
+            Text(rawContent)
+                .font(.system(size: 12.5, weight: .semibold))
+                .foregroundStyle(.primary)
+                .lineSpacing(3.5)
+                .textSelection(.enabled)
+        } else {
+            let normalized = rawContent
+                .replacingOccurrences(of: "\\times", with: "×")
+                .replacingOccurrences(of: "\\rightarrow", with: "→")
+                .replacingOccurrences(of: "\\to", with: "→")
+                .replacingOccurrences(of: "\\approx", with: "≈")
+                .replacingOccurrences(of: "\\le", with: "≤")
+                .replacingOccurrences(of: "\\ge", with: "≥")
+            let blocks = ChatMarkdownFormatter.parseBlocks(normalized)
+
+            VStack(alignment: .leading, spacing: 6.5) {
+                ForEach(Array(blocks.enumerated()), id: \.offset) { _, block in
+                    switch block {
+                    case .heading(let h):
+                        Text(ChatMarkdownFormatter.makeSafeAttributedString(h))
+                            .font(.system(size: 12.5, weight: .bold))
+                            .foregroundStyle(.primary)
+                            .padding(.top, 2)
+                            .textSelection(.enabled)
+
+                    case .paragraph(let p):
+                        Text(ChatMarkdownFormatter.makeSafeAttributedString(p))
+                            .font(.system(size: 12.5))
+                            .foregroundStyle(Color.primary.opacity(0.92))
+                            .lineSpacing(4)
+                            .textSelection(.enabled)
+
+                    case .bulletItem(let marker, let body):
+                        HStack(alignment: .top, spacing: 6) {
+                            Text(marker)
+                                .font(.system(size: marker == "•" ? 12.5 : 11.5, weight: .bold, design: marker == "•" ? .default : .monospaced))
+                                .foregroundStyle(palette.calendarTone)
+                                .frame(minWidth: marker == "•" ? 10 : 18, alignment: .leading)
+                                .padding(.top, marker == "•" ? 0 : 1)
+
+                            Text(ChatMarkdownFormatter.makeSafeAttributedString(body))
+                                .font(.system(size: 12.5))
+                                .foregroundStyle(Color.primary.opacity(0.92))
+                                .lineSpacing(4)
+                                .frame(maxWidth: .infinity, alignment: .leading)
+                                .textSelection(.enabled)
+                        }
+
+                    case .codeBlock(_, let code):
+                        ScrollView(.horizontal, showsIndicators: false) {
+                            Text(code)
+                                .font(.system(size: 11.5, design: .monospaced))
+                                .foregroundStyle(Color.primary.opacity(0.90))
+                                .textSelection(.enabled)
+                                .padding(.horizontal, 10)
+                                .padding(.vertical, 7)
+                        }
+                        .frame(maxWidth: .infinity, alignment: .leading)
+                        .background(
+                            RoundedRectangle(cornerRadius: 6, style: .continuous)
+                                .fill(palette.subtleButtonBg)
+                                .overlay(RoundedRectangle(cornerRadius: 6, style: .continuous).strokeBorder(palette.hairline, lineWidth: 1))
+                        )
+
+                    case .table(let headers, let rows):
+                        markdownTableBlockView(headers: headers, rows: rows)
+                    }
+                }
+            }
+        }
+    }
+
+    private func markdownTableBlockView(headers: [String], rows: [[String]]) -> some View {
+        VStack(alignment: .leading, spacing: 0) {
+            // Header Row
+            HStack(alignment: .top, spacing: 0) {
+                ForEach(Array(headers.enumerated()), id: \.offset) { colIdx, header in
+                    Text(ChatMarkdownFormatter.makeSafeAttributedString(header))
+                        .font(.system(size: 11.5, weight: .bold))
+                        .foregroundStyle(.primary)
+                        .frame(maxWidth: .infinity, alignment: .leading)
+                        .padding(.horizontal, 9)
+                        .padding(.vertical, 6)
+                        .overlay(alignment: .trailing) {
+                            if colIdx < headers.count - 1 {
+                                Rectangle().fill(palette.hairline).frame(width: 1)
+                            }
+                        }
+                }
+            }
+            .background(palette.subtleButtonBg)
+
+            ForEach(Array(rows.enumerated()), id: \.offset) { _, row in
+                Rectangle().fill(palette.hairline).frame(height: 1)
+                HStack(alignment: .top, spacing: 0) {
+                    ForEach(Array(row.enumerated()), id: \.offset) { colIdx, cell in
+                        Text(ChatMarkdownFormatter.makeSafeAttributedString(cell))
+                            .font(.system(size: 11.5))
+                            .foregroundStyle(Color.primary.opacity(0.90))
+                            .lineSpacing(2.5)
+                            .textSelection(.enabled)
+                            .frame(maxWidth: .infinity, alignment: .leading)
+                            .padding(.horizontal, 9)
+                            .padding(.vertical, 5.5)
+                            .overlay(alignment: .trailing) {
+                                if colIdx < row.count - 1 {
+                                    Rectangle().fill(palette.hairline).frame(width: 1)
+                                }
+                            }
+                    }
+                }
+            }
+        }
+        .clipShape(RoundedRectangle(cornerRadius: 6.5, style: .continuous))
+        .overlay(
+            RoundedRectangle(cornerRadius: 6.5, style: .continuous)
+                .strokeBorder(palette.hairline, lineWidth: 1)
+        )
+        .padding(.vertical, 2)
+    }
+
+    private func handleDroppedPDFProviders(_ providers: [NSItemProvider], onResolved: @escaping @Sendable (URL) -> Void) -> Bool {
+        guard let provider = providers.first(where: {
+            $0.hasItemConformingToTypeIdentifier(UTType.pdf.identifier) || $0.hasItemConformingToTypeIdentifier(UTType.fileURL.identifier)
+        }) else {
+            return false
+        }
+
+        if provider.hasItemConformingToTypeIdentifier(UTType.fileURL.identifier) {
+            provider.loadItem(forTypeIdentifier: UTType.fileURL.identifier, options: nil) { item, _ in
+                let resolvedURL: URL?
+                if let url = item as? URL {
+                    resolvedURL = url
+                } else if let data = item as? Data, let url = URL(dataRepresentation: data, relativeTo: nil) {
+                    resolvedURL = url
+                } else {
+                    resolvedURL = nil
+                }
+                if let resolvedURL, resolvedURL.pathExtension.lowercased() == "pdf" {
+                    onResolved(resolvedURL)
+                }
+            }
+            return true
+        }
+
+        provider.loadFileRepresentation(forTypeIdentifier: UTType.pdf.identifier) { tempURL, _ in
+            guard let tempURL else { return }
+            let stableCopy = FileManager.default.temporaryDirectory
+                .appendingPathComponent("MemoPilot-Drop-\(UUID().uuidString).pdf")
+            if (try? FileManager.default.copyItem(at: tempURL, to: stableCopy)) != nil {
+                onResolved(stableCopy)
+            }
+        }
+        return true
     }
 
     // MARK: - Precision Aligned Reusable Subviews (16pt Icon Column + 8pt Gap = 24pt Text Indent!)
@@ -1884,29 +2425,6 @@ struct PaperDigestWorkspaceView: View {
         } else {
             return shortDateFormatter.string(from: date)
         }
-    }
-
-    private static func renderChatMarkdown(_ raw: String) -> AttributedString {
-        let cleaned = raw
-            .replacingOccurrences(of: "\\(", with: "")
-            .replacingOccurrences(of: "\\)", with: "")
-            .replacingOccurrences(of: "\\[", with: "")
-            .replacingOccurrences(of: "\\]", with: "")
-            .replacingOccurrences(of: "\\times", with: "×")
-            .replacingOccurrences(of: "\\rightarrow", with: "→")
-            .replacingOccurrences(of: "\\to", with: "→")
-            .replacingOccurrences(of: "\\approx", with: "≈")
-            .replacingOccurrences(of: "\\le", with: "≤")
-            .replacingOccurrences(of: "\\ge", with: "≥")
-            .replacingOccurrences(of: "\n- ", with: "\n• ")
-
-        if let attr = try? AttributedString(
-            markdown: cleaned,
-            options: AttributedString.MarkdownParsingOptions(interpretedSyntax: .inlineOnlyPreservingWhitespace)
-        ) {
-            return attr
-        }
-        return AttributedString(cleaned)
     }
 }
 

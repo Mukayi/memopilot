@@ -1,5 +1,6 @@
 import SwiftUI
 import AppKit
+import UniformTypeIdentifiers
 import MemoPilotCore
 
 @MainActor
@@ -7,14 +8,20 @@ final class PaperDigestViewModel: ObservableObject {
     @Published var isAnalyzing: Bool = false
     @Published var isArchivingNotes: Bool = false
     @Published private(set) var discussingRecordIDs: Set<UUID> = []
+    @Published private(set) var loadingPDFRecordIDs: Set<UUID> = []
     @Published var statusBanner: String?
     @Published var isErrorBanner: Bool = false
 
     @Published var records: [PaperDigestRecord] = []
     @Published var latestCreatedRecordID: UUID?
+    @Published private var discussionDraftsByRecord: [UUID: String] = [:]
 
     private let store = PaperDigestStore.shared
     private var notesSaveDebounceTask: Task<Void, Never>?
+    private var discussionTasks: [UUID: Task<Bool, Never>] = [:]
+    private var pendingUserMessageIDs: [UUID: UUID] = [:]
+    private var pdfPrefetchTasks: [UUID: Task<Void, Never>] = [:]
+    private var activeAnalysisTask: Task<UUID?, Never>?
 
     var savedExportDirectoryPath: String? {
         store.savedExportDirectoryPath
@@ -22,7 +29,32 @@ final class PaperDigestViewModel: ObservableObject {
 
     init() {
         let hadFile = store.hasExistingStoreFile
-        let loaded = store.loadAll()
+        var loaded = store.loadAll()
+
+        // Reconcile crash-leftover unanswered user turns & stale cached PDF metadata
+        var didMutateOnStartup = false
+        for i in loaded.indices {
+            if loaded[i].discussionMessages.last?.role == .user {
+                loaded[i].discussionMessages.removeLast()
+                didMutateOnStartup = true
+            }
+            let expectedPagesURL = store.cachedPDFPagesFileURL(for: loaded[i].id)
+            let expectedPDFURL = store.cachedPDFFileURL(for: loaded[i].id)
+            if FileManager.default.fileExists(atPath: expectedPDFURL.path),
+               let cachedDoc = PaperPDFService.loadCachedDocumentIfPresent(for: loaded[i].id, store: store) {
+                if loaded[i].cachedPDFPath != expectedPDFURL.path || loaded[i].cachedPDFPageCount != cachedDoc.pageCount {
+                    loaded[i].cachedPDFPath = expectedPDFURL.path
+                    loaded[i].cachedPDFPageCount = cachedDoc.pageCount
+                    didMutateOnStartup = true
+                }
+            } else if !FileManager.default.fileExists(atPath: expectedPagesURL.path),
+                      (loaded[i].cachedPDFPageCount != nil || loaded[i].cachedPDFPath != nil) {
+                loaded[i].cachedPDFPath = nil
+                loaded[i].cachedPDFPageCount = nil
+                didMutateOnStartup = true
+            }
+        }
+
         if loaded.isEmpty && !hadFile && !UserDefaults.standard.bool(forKey: "MemoPilot.didSeedPaperSampleV1") {
             let sample = Self.makeInitialSampleRecord()
             UserDefaults.standard.set(true, forKey: "MemoPilot.didSeedPaperSampleV1")
@@ -30,9 +62,36 @@ final class PaperDigestViewModel: ObservableObject {
             self.store.saveAll([sample])
         } else {
             self.records = loaded
+            if didMutateOnStartup {
+                self.store.saveAll(loaded)
+            }
         }
+
+        store.pruneOrphanedPDFAssets(keepingRecordIDs: Set(self.records.map(\.id)))
         self.latestCreatedRecordID = self.records.first?.id
+
+        if let firstID = self.records.first?.id {
+            prefetchPDFIfNeeded(for: firstID, silent: true)
+        }
     }
+
+    // MARK: - Per-Record Discussion Drafts
+
+    func discussionDraft(for recordID: UUID?) -> String {
+        guard let recordID else { return "" }
+        return discussionDraftsByRecord[recordID] ?? ""
+    }
+
+    func setDiscussionDraft(_ text: String, for recordID: UUID?) {
+        guard let recordID else { return }
+        if text.isEmpty {
+            discussionDraftsByRecord.removeValue(forKey: recordID)
+        } else {
+            discussionDraftsByRecord[recordID] = text
+        }
+    }
+
+    // MARK: - Filtering & Selection
 
     func filteredRecords(query: String, filter: PaperDigestFilter) -> [PaperDigestRecord] {
         records.filter { rec in
@@ -80,25 +139,193 @@ final class PaperDigestViewModel: ObservableObject {
     }
 
     func deleteRecord(_ id: UUID) {
+        discussionTasks[id]?.cancel()
+        discussionTasks.removeValue(forKey: id)
+        pendingUserMessageIDs.removeValue(forKey: id)
+        discussingRecordIDs.remove(id)
+        pdfPrefetchTasks[id]?.cancel()
+        pdfPrefetchTasks.removeValue(forKey: id)
+        loadingPDFRecordIDs.remove(id)
+        discussionDraftsByRecord.removeValue(forKey: id)
+
         records.removeAll { $0.id == id }
+        store.removeCachedAssets(for: id)
         saveRecordsImmediately()
     }
 
     func clearAllRecords() {
+        for (_, task) in discussionTasks { task.cancel() }
+        discussionTasks.removeAll()
+        pendingUserMessageIDs.removeAll()
+        discussingRecordIDs.removeAll()
+        for (_, task) in pdfPrefetchTasks { task.cancel() }
+        pdfPrefetchTasks.removeAll()
+        loadingPDFRecordIDs.removeAll()
+        discussionDraftsByRecord.removeAll()
+
         records.removeAll()
         latestCreatedRecordID = nil
         statusBanner = nil
         isErrorBanner = false
+        store.removeAllCachedAssets()
         saveRecordsImmediately()
     }
 
-    // MARK: - Multi-Turn Discussion With Cursor
+    // MARK: - Original PDF Caching, Prefetching & Local PDF Attachment
+
+    func isLoadingPDF(_ recordID: UUID) -> Bool {
+        loadingPDFRecordIDs.contains(recordID)
+    }
+
+    func hasReadyPDF(_ record: PaperDigestRecord) -> Bool {
+        if let count = record.cachedPDFPageCount, count > 0,
+           let path = record.cachedPDFPath,
+           FileManager.default.fileExists(atPath: path) {
+            return true
+        }
+        return PaperPDFService.loadCachedDocumentIfPresent(for: record.id, store: store) != nil
+    }
+
+    func canAutoFetchRemotePDF(_ record: PaperDigestRecord) -> Bool {
+        if !record.digest.pdfURL.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+            return true
+        }
+        return !WebArticleFetcher.extractArxivIDs(from: record.digest.paperURL + "\n" + record.digest.sourceURL).isEmpty
+    }
+
+    func prefetchPDFIfNeeded(for recordID: UUID, silent: Bool = true) {
+        guard let rec = records.first(where: { $0.id == recordID }) else { return }
+        if hasReadyPDF(rec) {
+            if rec.cachedPDFPageCount == nil,
+               let doc = PaperPDFService.loadCachedDocumentIfPresent(for: recordID, store: store),
+               let idx = records.firstIndex(where: { $0.id == recordID }) {
+                records[idx].cachedPDFPath = store.cachedPDFFileURL(for: recordID).path
+                records[idx].cachedPDFPageCount = doc.pageCount
+                saveRecordsImmediately()
+            }
+            return
+        }
+        guard canAutoFetchRemotePDF(rec) || rec.cachedPDFPath != nil else { return }
+        guard pdfPrefetchTasks[recordID] == nil else { return }
+
+        loadingPDFRecordIDs.insert(recordID)
+        let snapshot = rec
+        let storeRef = self.store
+        let task = Task { @MainActor [weak self] in
+            defer {
+                self?.loadingPDFRecordIDs.remove(recordID)
+                self?.pdfPrefetchTasks.removeValue(forKey: recordID)
+            }
+            do {
+                let (pdfPath, doc) = try await Task.detached(priority: .utility) {
+                    try await PaperPDFService.ensureCachedPDF(for: snapshot, store: storeRef)
+                }.value
+                guard let self, !Task.isCancelled,
+                      let idx = self.records.firstIndex(where: { $0.id == recordID }) else { return }
+                self.records[idx].cachedPDFPath = pdfPath
+                self.records[idx].cachedPDFPageCount = doc.pageCount
+                self.saveRecordsImmediately()
+                if !silent {
+                    self.isErrorBanner = false
+                    self.statusBanner = "📄 已加载原始论文 PDF（共 \(doc.pageCount) 页），后续提问将自动结合全文作答"
+                }
+            } catch {
+                guard let self, !Task.isCancelled else { return }
+                if !silent {
+                    self.isErrorBanner = true
+                    self.statusBanner = error.localizedDescription
+                }
+            }
+        }
+        pdfPrefetchTasks[recordID] = task
+    }
+
+    func chooseAndAttachLocalPDF(for recordID: UUID) {
+        let panel = NSOpenPanel()
+        panel.title = "选择该论文对应的原始 PDF 文档"
+        panel.prompt = "关联此 PDF"
+        panel.allowedContentTypes = [.pdf]
+        panel.canChooseFiles = true
+        panel.canChooseDirectories = false
+        panel.allowsMultipleSelection = false
+        if panel.runModal() == .OK, let url = panel.url {
+            attachLocalPDF(url: url, for: recordID)
+        }
+    }
+
+    func attachLocalPDF(url: URL, for recordID: UUID) {
+        guard records.contains(where: { $0.id == recordID }) else { return }
+        pdfPrefetchTasks[recordID]?.cancel()
+        pdfPrefetchTasks.removeValue(forKey: recordID)
+        loadingPDFRecordIDs.insert(recordID)
+
+        let storeRef = self.store
+        Task { @MainActor [weak self] in
+            defer { self?.loadingPDFRecordIDs.remove(recordID) }
+            do {
+                let (savedPath, doc) = try await Task.detached(priority: .userInitiated) {
+                    try PaperPDFService.importLocalPDF(sourceURL: url, for: recordID, store: storeRef)
+                }.value
+                guard let self, let idx = self.records.firstIndex(where: { $0.id == recordID }) else { return }
+                self.records[idx].cachedPDFPath = savedPath
+                self.records[idx].cachedPDFPageCount = doc.pageCount
+                self.records[idx].updatedAt = Date()
+                self.saveRecordsImmediately()
+                self.isErrorBanner = false
+                self.statusBanner = "📄 已关联本地原始 PDF（共 \(doc.pageCount) 页），提问将结合全文检索作答"
+            } catch {
+                self?.isErrorBanner = true
+                self?.statusBanner = "关联 PDF 失败：\(error.localizedDescription)"
+            }
+        }
+    }
+
+    func openPDFForReading(_ record: PaperDigestRecord) {
+        if let localPath = record.cachedPDFPath,
+           FileManager.default.fileExists(atPath: localPath) {
+            NSWorkspace.shared.open(URL(fileURLWithPath: localPath))
+            return
+        }
+        let cachedURL = store.cachedPDFFileURL(for: record.id)
+        if FileManager.default.fileExists(atPath: cachedURL.path) {
+            NSWorkspace.shared.open(cachedURL)
+            return
+        }
+        if !record.digest.pdfURL.isEmpty, let remoteURL = URL(string: record.digest.pdfURL) {
+            NSWorkspace.shared.open(remoteURL)
+        }
+    }
+
+    // MARK: - Multi-Turn Discussion (Grounded in Card + Original PDF)
 
     func isDiscussing(_ recordID: UUID) -> Bool {
         discussingRecordIDs.contains(recordID)
     }
 
+    func cancelDiscussion(recordID: UUID) {
+        guard let running = discussionTasks[recordID] else { return }
+        running.cancel()
+        discussionTasks.removeValue(forKey: recordID)
+        discussingRecordIDs.remove(recordID)
+
+        if let pendingMsgID = pendingUserMessageIDs.removeValue(forKey: recordID),
+           let idx = records.firstIndex(where: { $0.id == recordID }),
+           let msgIdx = records[idx].discussionMessages.firstIndex(where: { $0.id == pendingMsgID }) {
+            let restoredQuestion = records[idx].discussionMessages[msgIdx].content
+            records[idx].discussionMessages.remove(at: msgIdx)
+            saveRecordsImmediately()
+            if (discussionDraftsByRecord[recordID] ?? "").isEmpty {
+                discussionDraftsByRecord[recordID] = restoredQuestion
+            }
+        }
+    }
+
     func clearDiscussion(recordID: UUID) {
+        discussionTasks[recordID]?.cancel()
+        discussionTasks.removeValue(forKey: recordID)
+        pendingUserMessageIDs.removeValue(forKey: recordID)
+        discussingRecordIDs.remove(recordID)
+
         guard let idx = records.firstIndex(where: { $0.id == recordID }) else { return }
         records[idx].discussionMessages.removeAll()
         records[idx].updatedAt = Date()
@@ -122,6 +349,8 @@ final class PaperDigestViewModel: ObservableObject {
         let snapshotRecord = records[initialIdx]
         let priorHistory = snapshotRecord.discussionMessages
         let userMsg = PaperDiscussionMessage(role: .user, content: trimmed)
+        pendingUserMessageIDs[recordID] = userMsg.id
+        discussionDraftsByRecord.removeValue(forKey: recordID)
 
         withAnimation(.easeInOut(duration: 0.16)) {
             records[initialIdx].discussionMessages.append(userMsg)
@@ -130,47 +359,116 @@ final class PaperDigestViewModel: ObservableObject {
             isErrorBanner = false
         }
         saveRecordsImmediately()
-        defer { discussingRecordIDs.remove(recordID) }
 
-        do {
-            let answer = try await PaperDigestAnalyzer.askFollowUp(
-                record: snapshotRecord,
-                priorHistory: priorHistory,
-                question: trimmed,
-                preferredMode: preferredMode,
-                speedProfile: speedProfile
-            )
-            let assistantMsg = PaperDiscussionMessage(role: .assistant, content: answer)
-            withAnimation(.spring(response: 0.28, dampingFraction: 0.86)) {
-                if let targetIdx = records.firstIndex(where: { $0.id == recordID }) {
-                    records[targetIdx].discussionMessages.append(assistantMsg)
-                    records[targetIdx].updatedAt = Date()
-                    saveRecordsImmediately()
+        let storeRef = self.store
+        let task = Task<Bool, Never> { @MainActor [weak self] in
+            guard let self else { return false }
+            defer {
+                self.discussingRecordIDs.remove(recordID)
+                self.discussionTasks.removeValue(forKey: recordID)
+                self.pendingUserMessageIDs.removeValue(forKey: recordID)
+            }
+
+            // Ensure original PDF pages are loaded (either from cache or fetched on-the-fly)
+            var pdfDoc = PaperPDFService.loadCachedDocumentIfPresent(for: recordID, store: storeRef)
+            if pdfDoc == nil {
+                if let runningPrefetch = self.pdfPrefetchTasks[recordID] {
+                    await runningPrefetch.value
+                    pdfDoc = PaperPDFService.loadCachedDocumentIfPresent(for: recordID, store: storeRef)
+                } else if self.canAutoFetchRemotePDF(snapshotRecord) || snapshotRecord.cachedPDFPath != nil {
+                    self.loadingPDFRecordIDs.insert(recordID)
+                    if let fetched = try? await Task.detached(priority: .userInitiated, operation: {
+                        try await PaperPDFService.ensureCachedPDF(for: snapshotRecord, store: storeRef)
+                    }).value {
+                        pdfDoc = fetched.document
+                        if let rIdx = self.records.firstIndex(where: { $0.id == recordID }) {
+                            self.records[rIdx].cachedPDFPath = fetched.pdfPath
+                            self.records[rIdx].cachedPDFPageCount = fetched.document.pageCount
+                            self.saveRecordsImmediately()
+                        }
+                    }
+                    self.loadingPDFRecordIDs.remove(recordID)
                 }
             }
-            return true
-        } catch {
-            withAnimation(.easeInOut(duration: 0.18)) {
-                if let targetIdx = records.firstIndex(where: { $0.id == recordID }) {
-                    records[targetIdx].discussionMessages.removeAll { $0.id == userMsg.id }
-                    saveRecordsImmediately()
+
+            if Task.isCancelled { return false }
+
+            do {
+                let latestRecordSnapshot = self.records.first(where: { $0.id == recordID }) ?? snapshotRecord
+                let answer = try await PaperDigestAnalyzer.askFollowUp(
+                    record: latestRecordSnapshot,
+                    priorHistory: priorHistory,
+                    question: trimmed,
+                    pdfDocument: pdfDoc,
+                    preferredMode: preferredMode,
+                    speedProfile: speedProfile
+                )
+                guard !Task.isCancelled else { return false }
+
+                let assistantMsg = PaperDiscussionMessage(role: .assistant, content: answer)
+                withAnimation(.spring(response: 0.28, dampingFraction: 0.86)) {
+                    self.discussingRecordIDs.remove(recordID)
+                    // Only append if the record AND `userMsg` were NOT cleared/deleted while waiting!
+                    if let targetIdx = self.records.firstIndex(where: { $0.id == recordID }),
+                       self.records[targetIdx].discussionMessages.contains(where: { $0.id == userMsg.id }) {
+                        self.records[targetIdx].discussionMessages.append(assistantMsg)
+                        self.records[targetIdx].updatedAt = Date()
+                        self.saveRecordsImmediately()
+                    }
                 }
-                isErrorBanner = true
-                statusBanner = "继续讨论请求失败：\(error.localizedDescription)"
+                return true
+            } catch is CancellationError {
+                withAnimation(.easeInOut(duration: 0.16)) {
+                    if let targetIdx = self.records.firstIndex(where: { $0.id == recordID }) {
+                        self.records[targetIdx].discussionMessages.removeAll { $0.id == userMsg.id }
+                        self.saveRecordsImmediately()
+                    }
+                }
+                return false
+            } catch {
+                withAnimation(.easeInOut(duration: 0.18)) {
+                    if let targetIdx = self.records.firstIndex(where: { $0.id == recordID }) {
+                        self.records[targetIdx].discussionMessages.removeAll { $0.id == userMsg.id }
+                        self.saveRecordsImmediately()
+                    }
+                    if (self.discussionDraftsByRecord[recordID] ?? "").isEmpty {
+                        self.discussionDraftsByRecord[recordID] = trimmed
+                    }
+                    self.isErrorBanner = true
+                    self.statusBanner = "讨论提问失败：\(error.localizedDescription)"
+                }
+                return false
             }
-            return false
         }
+
+        discussionTasks[recordID] = task
+        return await task.value
     }
 
-    // MARK: - Analyze Link / Article
+    // MARK: - Analyze Link / Article / Local PDF
+
+    func cancelAnalysis() {
+        activeAnalysisTask?.cancel()
+        activeAnalysisTask = nil
+        isAnalyzing = false
+        statusBanner = nil
+    }
 
     @discardableResult
     func pasteClipboardAndAnalyze(preferredMode: AIProviderMode, speedProfile: AISpeedProfile) async -> UUID? {
         guard !isAnalyzing else { return nil }
+
+        // 1. Check if user copied a `.pdf` file directly in Finder (`⌘C`)
+        if let copiedURLs = NSPasteboard.general.readObjects(forClasses: [NSURL.self], options: [.urlReadingFileURLsOnly: true]) as? [URL],
+           let firstPDF = copiedURLs.first(where: { $0.pathExtension.lowercased() == "pdf" }) {
+            return await runAnalysis(rawInput: firstPDF.path, preferredMode: preferredMode, speedProfile: speedProfile)
+        }
+
+        // 2. Otherwise read clipboard text / URL
         let rawClipboard = NSPasteboard.general.string(forType: .string)?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
         guard !rawClipboard.isEmpty else {
             isErrorBanner = true
-            statusBanner = "剪贴板为空，请先复制微信公众号推送链接、arXiv 链接或文章正文"
+            statusBanner = "剪贴板为空，请先复制公众号链接、arXiv 链接、本地 PDF 文件或文章正文"
             return nil
         }
         return await runAnalysis(rawInput: rawClipboard, preferredMode: preferredMode, speedProfile: speedProfile)
@@ -186,52 +484,77 @@ final class PaperDigestViewModel: ObservableObject {
         let submitted = rawInput.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !submitted.isEmpty else {
             isErrorBanner = true
-            statusBanner = "请粘贴微信公众号文章链接、arXiv / HuggingFace / GitHub 链接，或直接粘贴正文"
+            statusBanner = "请粘贴微信公众号文章链接、arXiv / HuggingFace / GitHub 链接，或拖入本地 PDF"
             return nil
         }
 
         withAnimation(.easeInOut(duration: 0.2)) {
             isAnalyzing = true
             isErrorBanner = false
-            statusBanner = "🌐 正在解析链接内容…"
+            statusBanner = "🌐 正在解析内容…"
         }
 
-        do {
-            let digest = try await PaperDigestAnalyzer.analyze(
-                rawInput: submitted,
-                preferredMode: preferredMode,
-                speedProfile: speedProfile,
-                onStageChange: { [weak self] msg in
-                    Task { @MainActor in
-                        self?.statusBanner = msg
+        let storeRef = self.store
+        let task = Task<UUID?, Never> { @MainActor [weak self] in
+            guard let self else { return nil }
+            do {
+                let digest = try await PaperDigestAnalyzer.analyze(
+                    rawInput: submitted,
+                    preferredMode: preferredMode,
+                    speedProfile: speedProfile,
+                    onStageChange: { [weak self] msg in
+                        Task { @MainActor in
+                            self?.statusBanner = msg
+                        }
                     }
+                )
+                guard !Task.isCancelled else { return nil }
+
+                var newRecord = PaperDigestRecord(
+                    createdAt: Date(),
+                    updatedAt: Date(),
+                    isPinned: false,
+                    digest: digest
+                )
+
+                // If the analyzed input was a local PDF file, cache & attach it immediately!
+                if let localPDF = WebArticleFetcher.extractLocalPDFFileURL(from: submitted),
+                   let imported = try? PaperPDFService.importLocalPDF(sourceURL: localPDF, for: newRecord.id, store: storeRef) {
+                    newRecord.cachedPDFPath = imported.pdfPath
+                    newRecord.cachedPDFPageCount = imported.document.pageCount
                 }
-            )
 
-            let newRecord = PaperDigestRecord(
-                createdAt: Date(),
-                updatedAt: Date(),
-                isPinned: false,
-                digest: digest
-            )
+                withAnimation(.spring(response: 0.30, dampingFraction: 0.85)) {
+                    self.records.insert(newRecord, at: 0)
+                    self.latestCreatedRecordID = newRecord.id
+                    self.isAnalyzing = false
+                    self.isErrorBanner = false
+                    self.statusBanner = "✨ 解析完成：\(digest.primaryDisplayTitle)"
+                    self.saveRecordsImmediately()
+                }
 
-            withAnimation(.spring(response: 0.30, dampingFraction: 0.85)) {
-                records.insert(newRecord, at: 0)
-                latestCreatedRecordID = newRecord.id
-                isAnalyzing = false
-                isErrorBanner = false
-                statusBanner = "✨ 解析完成：\(digest.primaryDisplayTitle)"
-                saveRecordsImmediately()
+                // Proactively pre-cache remote PDF in background so follow-up Q&A is instant!
+                self.prefetchPDFIfNeeded(for: newRecord.id, silent: true)
+                return newRecord.id
+            } catch is CancellationError {
+                withAnimation(.easeInOut(duration: 0.2)) {
+                    self.isAnalyzing = false
+                    self.statusBanner = nil
+                }
+                return nil
+            } catch {
+                withAnimation(.easeInOut(duration: 0.2)) {
+                    self.isAnalyzing = false
+                    self.isErrorBanner = true
+                    self.statusBanner = error.localizedDescription
+                }
+                return nil
             }
-            return newRecord.id
-        } catch {
-            withAnimation(.easeInOut(duration: 0.2)) {
-                isAnalyzing = false
-                isErrorBanner = true
-                statusBanner = error.localizedDescription
-            }
-            return nil
         }
+        activeAnalysisTask = task
+        let result = await task.value
+        activeAnalysisTask = nil
+        return result
     }
 
     // MARK: - Export & Archive Actions
@@ -241,7 +564,7 @@ final class PaperDigestViewModel: ObservableObject {
         NSPasteboard.general.clearContents()
         NSPasteboard.general.setString(md, forType: .string)
         isErrorBanner = false
-        statusBanner = "📋 已复制完整 Markdown 论文笔记（含 YAML 头与链接，可直接粘贴至 Obsidian / Notion / 飞书）"
+        statusBanner = "📋 已复制完整 Markdown 论文笔记（含 YAML 头与讨论记录，可直接粘贴至 Obsidian / Notion / 飞书）"
     }
 
     func archiveToAppleNotes(_ record: PaperDigestRecord) async {

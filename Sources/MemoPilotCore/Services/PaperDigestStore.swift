@@ -23,6 +23,7 @@ public final class PaperDigestStore: @unchecked Sendable {
     public static let shared = PaperDigestStore()
 
     public let storageURL: URL
+    public let pdfCacheDirectoryURL: URL
     private let lock = NSLock()
     private static let exportFolderDefaultsKey = "MemoPilot.paperMarkdownExportDirectory"
 
@@ -36,7 +37,48 @@ public final class PaperDigestStore: @unchecked Sendable {
             baseDir = appSupport.appendingPathComponent("MemoPilot", isDirectory: true)
         }
         self.storageURL = baseDir.appendingPathComponent("paper_digests.json")
+        self.pdfCacheDirectoryURL = baseDir.appendingPathComponent("PaperPDFs", isDirectory: true)
         try? FileManager.default.createDirectory(at: baseDir, withIntermediateDirectories: true)
+        try? FileManager.default.createDirectory(at: pdfCacheDirectoryURL, withIntermediateDirectories: true)
+    }
+
+    public func cachedPDFFileURL(for recordID: UUID) -> URL {
+        pdfCacheDirectoryURL.appendingPathComponent("\(recordID.uuidString).pdf")
+    }
+
+    public func cachedPDFPagesFileURL(for recordID: UUID) -> URL {
+        pdfCacheDirectoryURL.appendingPathComponent("\(recordID.uuidString).pages.json")
+    }
+
+    public func removeCachedAssets(for recordID: UUID) {
+        lock.withLock {
+            try? FileManager.default.removeItem(at: cachedPDFFileURL(for: recordID))
+            try? FileManager.default.removeItem(at: cachedPDFPagesFileURL(for: recordID))
+        }
+    }
+
+    public func removeAllCachedAssets() {
+        lock.withLock {
+            try? FileManager.default.removeItem(at: pdfCacheDirectoryURL)
+            try? FileManager.default.createDirectory(at: pdfCacheDirectoryURL, withIntermediateDirectories: true)
+        }
+    }
+
+    public func pruneOrphanedPDFAssets(keepingRecordIDs validIDs: Set<UUID>) {
+        lock.withLock {
+            guard let files = try? FileManager.default.contentsOfDirectory(
+                at: pdfCacheDirectoryURL,
+                includingPropertiesForKeys: nil
+            ) else { return }
+            let validPrefixes = Set(validIDs.map { $0.uuidString.lowercased() })
+            for fileURL in files {
+                let name = fileURL.lastPathComponent.lowercased()
+                let prefix = String(name.prefix(36))
+                if prefix.count == 36, UUID(uuidString: prefix) != nil, !validPrefixes.contains(prefix) {
+                    try? FileManager.default.removeItem(at: fileURL)
+                }
+            }
+        }
     }
 
     public var hasExistingStoreFile: Bool {

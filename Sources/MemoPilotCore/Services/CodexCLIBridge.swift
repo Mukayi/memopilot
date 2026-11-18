@@ -518,4 +518,104 @@ public enum CodexCLIBridge {
         }
         return stdout.isEmpty ? stderr : stdout
     }
+
+    @discardableResult
+    public static func runProcessCancellable(
+        _ executable: String,
+        arguments: [String],
+        workingDirectoryURL: URL? = nil,
+        timeout: TimeInterval = 75.0
+    ) async throws -> String {
+        try Task.checkCancellation()
+
+        let process = Process()
+        process.executableURL = URL(fileURLWithPath: executable)
+        process.arguments = arguments
+        process.standardInput = FileHandle.nullDevice
+        if let workingDirectoryURL {
+            process.currentDirectoryURL = workingDirectoryURL
+        }
+
+        var env = ProcessInfo.processInfo.environment
+        env["PATH"] = augmentedPATH()
+        for (k, v) in systemProxyEnvironment() where env[k] == nil {
+            env[k] = v
+        }
+        process.environment = env
+
+        let outPipe = Pipe()
+        let errPipe = Pipe()
+        process.standardOutput = outPipe
+        process.standardError = errPipe
+
+        return try await withTaskCancellationHandler {
+            try await withCheckedThrowingContinuation { continuation in
+                DispatchQueue.global(qos: .userInitiated).async {
+                    do {
+                        try process.run()
+                    } catch {
+                        continuation.resume(throwing: error)
+                        return
+                    }
+
+                    if Task.isCancelled {
+                        process.terminate()
+                        continuation.resume(throwing: CancellationError())
+                        return
+                    }
+
+                    let group = DispatchGroup()
+                    nonisolated(unsafe) var outData = Data()
+                    nonisolated(unsafe) var errData = Data()
+
+                    group.enter()
+                    DispatchQueue.global(qos: .userInitiated).async {
+                        outData = outPipe.fileHandleForReading.readDataToEndOfFile()
+                        group.leave()
+                    }
+
+                    group.enter()
+                    DispatchQueue.global(qos: .userInitiated).async {
+                        errData = errPipe.fileHandleForReading.readDataToEndOfFile()
+                        group.leave()
+                    }
+
+                    let waitResult = group.wait(timeout: .now() + timeout)
+                    if waitResult == .timedOut {
+                        process.terminate()
+                        continuation.resume(throwing: NSError(
+                            domain: "MemoPilot.Process",
+                            code: NSURLErrorTimedOut,
+                            userInfo: [NSLocalizedDescriptionKey: "AI 响应超时（>\(Int(timeout))秒），请检查网络连接/系统代理或重试。"]
+                        ))
+                        return
+                    }
+
+                    process.waitUntilExit()
+
+                    let stdout = String(data: outData, encoding: .utf8) ?? ""
+                    let stderr = String(data: errData, encoding: .utf8) ?? ""
+
+                    if process.terminationReason == .uncaughtSignal {
+                        continuation.resume(throwing: CancellationError())
+                        return
+                    }
+
+                    if process.terminationStatus != 0 {
+                        continuation.resume(throwing: NSError(
+                            domain: "MemoPilot.Process",
+                            code: Int(process.terminationStatus),
+                            userInfo: [NSLocalizedDescriptionKey: "命令执行失败 (\(process.terminationStatus)): \(stderr.isEmpty ? stdout : stderr)"]
+                        ))
+                        return
+                    }
+                    continuation.resume(returning: stdout.isEmpty ? stderr : stdout)
+                }
+            }
+        } onCancel: {
+            if process.isRunning {
+                process.terminate()
+            }
+        }
+    }
 }

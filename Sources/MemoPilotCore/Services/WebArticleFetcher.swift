@@ -33,6 +33,32 @@ public struct FetchedWebArticle: Sendable, Equatable {
 public enum WebArticleFetcher {
     private static let wechatDesktopUA =
         "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) MicroMessenger/6.8.0 Chrome/122.0.0.0 Safari/537.36"
+    private static let standardSafariUA =
+        "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/18.1 Safari/605.1.15"
+
+    /// Resolves a local `.pdf` file path or `file://` URL if the user pasted or dragged one.
+    public static func extractLocalPDFFileURL(from rawInput: String) -> URL? {
+        let trimmed = rawInput
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+            .trimmingCharacters(in: CharacterSet(charactersIn: "\"'"))
+        guard !trimmed.isEmpty else { return nil }
+
+        if trimmed.lowercased().hasPrefix("file://"),
+           let fileURL = URL(string: trimmed),
+           fileURL.isFileURL,
+           fileURL.pathExtension.lowercased() == "pdf",
+           FileManager.default.fileExists(atPath: fileURL.path) {
+            return fileURL
+        }
+
+        let expanded = (trimmed as NSString).expandingTildeInPath
+        if (expanded.hasPrefix("/") || trimmed.hasPrefix("~/")),
+           expanded.lowercased().hasSuffix(".pdf"),
+           FileManager.default.fileExists(atPath: expanded) {
+            return URL(fileURLWithPath: expanded)
+        }
+        return nil
+    }
 
     /// Extracts the first valid HTTP/HTTPS URL (unescaping `&amp;`, preserving balanced parentheses, stripping trailing CJK punctuation)
     /// or converts bare `arXiv:xxxx.xxxxx` into `https://arxiv.org/abs/...`.
@@ -104,8 +130,36 @@ public enum WebArticleFetcher {
     }
 
     public static func fetchAndClean(from rawInput: String) async throws -> FetchedWebArticle {
+        // 0. Local PDF file path or `file://` URL support (drag-and-drop or pasted local path)
+        if let localPDFURL = extractLocalPDFFileURL(from: rawInput) {
+            let extracted = try PaperPDFService.extractPages(fromPDFAt: localPDFURL)
+            let joinedPages = extracted.pages
+                .map { "[PDF 第 \($0.pageNumber) 页]\n\($0.text)" }
+                .joined(separator: "\n\n")
+            let cleanBody = sanitizeNullBytes(joinedPages)
+            let urls = extractInterestingURLs(from: cleanBody)
+            let arxivIDs = extractArxivIDs(from: cleanBody + "\n" + localPDFURL.lastPathComponent)
+            let arxivMeta = await fetchArxivMetadataIfAvailable(ids: arxivIDs)
+            return FetchedWebArticle(
+                sourceURL: localPDFURL.absoluteString,
+                siteOrAccountName: "本地 PDF 文档 (\(extracted.pageCount) 页)",
+                articleTitle: localPDFURL.deletingPathExtension().lastPathComponent,
+                cleanedBodyText: truncatePreservingHeadAndTail(cleanBody, maxChars: 28_000),
+                detectedExternalURLs: urls,
+                detectedArxivIDs: arxivIDs,
+                arxivOfficialMetadata: sanitizeNullBytes(arxivMeta)
+            )
+        }
+
         guard let rawURLString = extractPrimaryURL(from: rawInput) else {
-            let cleanRaw = sanitizeNullBytes(rawInput)
+            let cleanRaw = sanitizeNullBytes(rawInput).trimmingCharacters(in: .whitespacesAndNewlines)
+            guard cleanRaw.count >= 25 else {
+                throw NSError(
+                    domain: "MemoPilot.WebFetch",
+                    code: 400,
+                    userInfo: [NSLocalizedDescriptionKey: "请输入有效的公众号/论文链接、arXiv 编号、本地 PDF 路径，或粘贴至少 25 字的正文文本。"]
+                )
+            }
             let urls = extractInterestingURLs(from: cleanRaw)
             let arxivIDs = extractArxivIDs(from: cleanRaw)
             let arxivMeta = await fetchArxivMetadataIfAvailable(ids: arxivIDs)
@@ -146,13 +200,24 @@ public enum WebArticleFetcher {
             tier1Error = error
         }
 
-        // If Tier 1 explicitly rejected an unsupported binary media type (image/video/zip), surface immediately
-        if let nsErr = tier1Error as NSError?, nsErr.domain == "MemoPilot.UnsupportedMedia" {
-            throw nsErr
+        // Fast-fail on unsupported binary media or offline network errors (do NOT spin headless WKWebView when offline!)
+        if let nsErr = tier1Error as NSError? {
+            if nsErr.domain == "MemoPilot.UnsupportedMedia" {
+                throw nsErr
+            }
+            if nsErr.domain == NSURLErrorDomain,
+               [NSURLErrorNotConnectedToInternet, NSURLErrorCannotFindHost, NSURLErrorDNSLookupFailed, NSURLErrorNetworkConnectionLost].contains(nsErr.code) {
+                throw NSError(
+                    domain: "MemoPilot.WebFetch",
+                    code: nsErr.code,
+                    userInfo: [NSLocalizedDescriptionKey: "当前网络不可用或无法连接目标站点，请检查网络连接或系统代理后重试。"]
+                )
+            }
         }
 
+        let isDirectPDFTarget = targetURL.pathExtension.lowercased() == "pdf"
         // Tier 2: Per-call Headless WKWebView fallback if HTTP body was empty, JS-rendered, or hit a verification gate
-        if article == nil || (article?.cleanedBodyText.count ?? 0) < 120 || isBlockedVerificationText(article?.cleanedBodyText ?? "") {
+        if !isDirectPDFTarget && (article == nil || (article?.cleanedBodyText.count ?? 0) < 120 || isBlockedVerificationText(article?.cleanedBodyText ?? "")) {
             if let rendered = try? await OffscreenWebExtractor.extractRenderedPage(url: targetURL, originalURLString: rawURLString),
                rendered.cleanedBodyText.count > (article?.cleanedBodyText.count ?? 0) {
                 article = rendered
@@ -173,7 +238,7 @@ public enum WebArticleFetcher {
             resolved.cleanedBodyText = "【用户附言】：\(extraUserNote)\n\n" + resolved.cleanedBodyText
         }
 
-        // Tier 3: Cross-enrich with official arXiv API if any arXiv ID was found
+        // Tier 3: Cross-enrich with official arXiv API (+ full PDF pages when direct arXiv link only had short abstract!)
         var allArxivIDs = resolved.detectedArxivIDs
         for id in extractArxivIDs(from: resolved.sourceURL + "\n" + rawURLString) where !allArxivIDs.contains(id) {
             allArxivIDs.insert(id, at: 0)
@@ -182,6 +247,23 @@ public enum WebArticleFetcher {
 
         if !allArxivIDs.isEmpty {
             resolved.arxivOfficialMetadata = sanitizeNullBytes(await fetchArxivMetadataIfAvailable(ids: allArxivIDs))
+            // If input was a direct arXiv abstract/PDF link whose HTML body is just the short abstract, also pull the real arXiv PDF text!
+            if (targetURL.host ?? "").lowercased().contains("arxiv.org"),
+               resolved.cleanedBodyText.count < 2600,
+               let primaryID = allArxivIDs.first,
+               let pdfURL = URL(string: "https://arxiv.org/pdf/\(primaryID)"),
+               let pdfArticle = try? await fetchViaURLSession(url: pdfURL, originalURLString: pdfURL.absoluteString),
+               pdfArticle.cleanedBodyText.count > resolved.cleanedBodyText.count {
+                resolved.cleanedBodyText = resolved.cleanedBodyText + "\n\n【arXiv 原始 PDF 正文提取】：\n" + pdfArticle.cleanedBodyText
+            }
+        }
+
+        if isBlockedVerificationText(resolved.cleanedBodyText) && resolved.arxivOfficialMetadata.isEmpty {
+            throw NSError(
+                domain: "MemoPilot.WebFetch",
+                code: 403,
+                userInfo: [NSLocalizedDescriptionKey: "目标页面触发了反爬/环境验证，无法自动抓取正文。请先在浏览器打开该链接，复制正文粘贴到输入框解析。"]
+            )
         }
 
         if resolved.cleanedBodyText.trimmingCharacters(in: .whitespacesAndNewlines).count < 40
@@ -189,7 +271,7 @@ public enum WebArticleFetcher {
             throw NSError(
                 domain: "MemoPilot.WebFetch",
                 code: 422,
-                userInfo: [NSLocalizedDescriptionKey: "该链接页面受登录或反爬验证保护，未能自动提取正文。您可以复制网页正文粘贴到输入框直接解析。"]
+                userInfo: [NSLocalizedDescriptionKey: "该链接页面受登录保护或正文为空，未能自动提取内容。您可以复制网页正文粘贴到输入框直接解析。"]
             )
         }
 
@@ -209,11 +291,12 @@ public enum WebArticleFetcher {
     private static func fetchViaURLSession(url: URL, originalURLString: String) async throws -> FetchedWebArticle {
         let config = URLSessionConfiguration.ephemeral
         config.timeoutIntervalForRequest = 15.0
-        config.timeoutIntervalForResource = 22.0
+        config.timeoutIntervalForResource = 28.0
         let session = URLSession(configuration: config)
 
+        let isWeChatHost = (url.host ?? "").lowercased().contains("weixin.qq.com")
         var req = URLRequest(url: url)
-        req.setValue(wechatDesktopUA, forHTTPHeaderField: "User-Agent")
+        req.setValue(isWeChatHost ? wechatDesktopUA : standardSafariUA, forHTTPHeaderField: "User-Agent")
         req.setValue("zh-CN,zh;q=0.9,en;q=0.8", forHTTPHeaderField: "Accept-Language")
 
         let (data, response) = try await session.data(for: req)

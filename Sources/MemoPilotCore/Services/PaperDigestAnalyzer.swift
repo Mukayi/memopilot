@@ -68,27 +68,27 @@ public enum PaperDigestAnalyzer {
 
         let prompt = buildPaperAnalysisPrompt(fetched: fetched)
 
-        var digest = try await Task.detached(priority: .userInitiated) { () throws -> PaperDigest in
-            let tempDir = FileManager.default.temporaryDirectory
-                .appendingPathComponent("MemoPilot-Paper-\(UUID().uuidString)", isDirectory: true)
-            try FileManager.default.createDirectory(at: tempDir, withIntermediateDirectories: true)
-            defer { try? FileManager.default.removeItem(at: tempDir) }
+        let tempDir = FileManager.default.temporaryDirectory
+            .appendingPathComponent("MemoPilot-Paper-\(UUID().uuidString)", isDirectory: true)
+        try FileManager.default.createDirectory(at: tempDir, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: tempDir) }
 
-            let codexPath = CodexCLIBridge.findCodexBinary()
-            let codexLoggedIn = CodexCLIBridge.isCodexAuthenticated(codexBinary: codexPath)
+        let codexPath = CodexCLIBridge.findCodexBinary()
+        let codexLoggedIn = CodexCLIBridge.isCodexAuthenticated(codexBinary: codexPath)
 
-            // For deep paper synthesis, prefer at least balanced fast model on Cursor if user left default .flash
-            let effectiveModelSlug: String = (speedProfile == .flash)
-                ? AISpeedProfile.balanced.cursorModelSlug
-                : speedProfile.cursorModelSlug
+        // For deep paper synthesis, prefer at least balanced fast model on Cursor if user left default .flash
+        let effectiveModelSlug: String = (speedProfile == .flash)
+            ? AISpeedProfile.balanced.cursorModelSlug
+            : speedProfile.cursorModelSlug
 
-            var cursorAttemptError: Error?
-            if preferredMode != .openai,
-               let cursorBin = CodexCLIBridge.findCursorAgentBinary(),
+        var digest: PaperDigest?
+        var cursorAttemptError: Error?
+        if preferredMode != .openai {
+            if let cursorBin = CodexCLIBridge.findCursorAgentBinary(),
                let cursorKey = CodexCLIBridge.discoverCursorApiKey() {
                 let fullPrompt = prompt + "\n\n请只输出一个合法的 JSON 对象（不要调用任何外部工具，不要用 markdown 代码块包裹，不要任何解释文字），严格包含 schema 定义的全部字段：\n\(outputJSONSchema)"
                 do {
-                    let output = try CodexCLIBridge.runProcess(
+                    let output = try await CodexCLIBridge.runProcessCancellable(
                         cursorBin,
                         arguments: [
                             "--api-key", cursorKey,
@@ -103,15 +103,26 @@ public enum PaperDigestAnalyzer {
                         workingDirectoryURL: tempDir,
                         timeout: 75.0
                     )
-                    return try PaperDigest.decode(from: output)
+                    digest = try PaperDigest.decode(from: output)
+                } catch is CancellationError {
+                    throw CancellationError()
                 } catch {
+                    UserDefaults.standard.removeObject(forKey: "MemoPilot.cachedCursorApiKey")
                     cursorAttemptError = error
                     if preferredMode == .cursor {
                         throw error
                     }
                 }
+            } else if preferredMode == .cursor {
+                throw NSError(
+                    domain: "MemoPilot.PaperAI",
+                    code: 401,
+                    userInfo: [NSLocalizedDescriptionKey: "当前已固定选择 Cursor 模式，但未检测到已登录的 Cursor Agent。请在右上角切换为自动模式或登录 Cursor。"]
+                )
             }
+        }
 
+        if digest == nil {
             guard let codexPath else {
                 if let cursorAttemptError { throw cursorAttemptError }
                 throw NSError(
@@ -143,7 +154,7 @@ public enum PaperDigestAnalyzer {
                 speedProfile: speedProfile
             )
 
-            let processOut = try CodexCLIBridge.runProcess(
+            let processOut = try await CodexCLIBridge.runProcessCancellable(
                 codexPath,
                 arguments: args,
                 workingDirectoryURL: tempDir,
@@ -152,42 +163,44 @@ public enum PaperDigestAnalyzer {
             if FileManager.default.fileExists(atPath: outputURL.path),
                let rawJSON = try? String(contentsOf: outputURL, encoding: .utf8),
                !rawJSON.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
-                return try PaperDigest.decode(from: rawJSON)
-            }
-            return try PaperDigest.decode(from: processOut)
-        }.value
-
-        // Post-process & backfill deterministic links/metadata from fetched page
-        if digest.sourceURL.isEmpty { digest.sourceURL = fetched.sourceURL }
-        if digest.sourceAccountOrSite.isEmpty { digest.sourceAccountOrSite = fetched.siteOrAccountName }
-        if digest.sourceArticleTitle.isEmpty { digest.sourceArticleTitle = fetched.articleTitle }
-
-        if digest.paperURL.isEmpty {
-            if let arxivLink = fetched.detectedExternalURLs.first(where: { $0.lowercased().contains("arxiv.org/abs/") || $0.lowercased().contains("openreview.net") }) {
-                digest.paperURL = arxivLink
-            } else if let firstArxivID = fetched.detectedArxivIDs.first {
-                digest.paperURL = "https://arxiv.org/abs/\(firstArxivID)"
+                digest = try PaperDigest.decode(from: rawJSON)
+            } else {
+                digest = try PaperDigest.decode(from: processOut)
             }
         }
-        if digest.codeURL.isEmpty {
+
+        var finalDigest = digest ?? PaperDigest()
+        // Post-process & backfill deterministic links/metadata from fetched page
+        if finalDigest.sourceURL.isEmpty { finalDigest.sourceURL = fetched.sourceURL }
+        if finalDigest.sourceAccountOrSite.isEmpty { finalDigest.sourceAccountOrSite = fetched.siteOrAccountName }
+        if finalDigest.sourceArticleTitle.isEmpty { finalDigest.sourceArticleTitle = fetched.articleTitle }
+
+        if finalDigest.paperURL.isEmpty {
+            if let arxivLink = fetched.detectedExternalURLs.first(where: { $0.lowercased().contains("arxiv.org/abs/") || $0.lowercased().contains("openreview.net") }) {
+                finalDigest.paperURL = arxivLink
+            } else if let firstArxivID = fetched.detectedArxivIDs.first {
+                finalDigest.paperURL = "https://arxiv.org/abs/\(firstArxivID)"
+            }
+        }
+        if finalDigest.codeURL.isEmpty {
             let lowerSrc = fetched.sourceURL.lowercased()
             if lowerSrc.contains("github.com/") && !lowerSrc.contains(".github.io") {
-                digest.codeURL = fetched.sourceURL
+                finalDigest.codeURL = fetched.sourceURL
             } else if let ghLink = fetched.detectedExternalURLs.first(where: {
                 let l = $0.lowercased()
                 let isGitHubNoise = l.contains("/login") || l.contains("/signup") || l.contains("/sponsors") || l.contains("/orgs/") || l.contains("/topics/")
                 return !isGitHubNoise && ((l.contains("github.com/") && !l.contains(".github.io")) || l.contains("huggingface.co/"))
             }) {
-                digest.codeURL = ghLink
+                finalDigest.codeURL = ghLink
             }
         }
-        if digest.projectURL.isEmpty {
+        if finalDigest.projectURL.isEmpty {
             if let projLink = fetched.detectedExternalURLs.first(where: { $0.lowercased().contains(".github.io") }) {
-                digest.projectURL = projLink
+                finalDigest.projectURL = projLink
             }
         }
-        digest.normalizeDerivedLinks()
-        return digest
+        finalDigest.normalizeDerivedLinks()
+        return finalDigest
     }
 
     public static func buildPaperAnalysisPrompt(fetched: FetchedWebArticle) -> String {
@@ -218,7 +231,7 @@ public enum PaperDigestAnalyzer {
         2. `paperTitleZH`：准确凝练的中文标题（10~26字）。
         3. `shortAlias`：模型/方法简称（如 PixVid、DeepSeek-V3、FlashAttention-3；若无明确简称填空字符串 ""）。
         4. `authorsAndAffiliations`：核心完成单位与代表作者（如 "Roblox, UC Merced, UPenn, UT Austin（Yanke Song, Xun Huang 等）"）。
-        5. `venueAndDate`：发表会议/期刊或预印本状态与时间（如 "arXiv:2611.17336 · 2026-11-12 预印本" 或 "ICLR 2026 Oral"）。
+        5. `venueAndDate`：精炼的发表会议/期刊或预印本状态（严格控制在 28 字以内，如 "arXiv:2611.17336 · 2026-11-12 预印本" 或 "ICLR 2026 Oral"，不要附加"未提供正式接收信息"等冗长解释）。
         6. `paperURL` / `pdfURL` / `codeURL` / `projectURL`：只填文中或元数据中真实存在的 URL，绝不编造；若未开源则 `codeURL` 填 ""。
         7. `domainTags`：3~5 个精准技术领域标签（如 ["Video Diffusion", "Pixel-Space", "Real-Time World Model"]）。
         8. `oneLineConclusion`：一句话硬核结论（50~110字），必须同时讲清「它改了什么机制」+「换来什么核心量化收益」+「付出了什么代价」。
@@ -232,12 +245,13 @@ public enum PaperDigestAnalyzer {
         """
     }
 
-    // MARK: - Multi-Turn Follow-Up Discussion Grounded in Structured PaperDigest
+    // MARK: - Multi-Turn Follow-Up Discussion Grounded in Structured Card + Original PDF Full Text
 
     public static func askFollowUp(
         record: PaperDigestRecord,
         priorHistory: [PaperDiscussionMessage],
         question: String,
+        pdfDocument: ExtractedPDFDocument? = nil,
         preferredMode: AIProviderMode = .auto,
         speedProfile: AISpeedProfile = .balanced
     ) async throws -> String {
@@ -253,28 +267,28 @@ public enum PaperDigestAnalyzer {
         let prompt = buildFollowUpDiscussionPrompt(
             record: record,
             priorHistory: priorHistory,
-            question: cleanQuestion
+            question: cleanQuestion,
+            pdfDocument: pdfDocument
         )
 
-        return try await Task.detached(priority: .userInitiated) { () throws -> String in
-            let tempDir = FileManager.default.temporaryDirectory
-                .appendingPathComponent("MemoPilot-PaperChat-\(UUID().uuidString)", isDirectory: true)
-            try FileManager.default.createDirectory(at: tempDir, withIntermediateDirectories: true)
-            defer { try? FileManager.default.removeItem(at: tempDir) }
+        let tempDir = FileManager.default.temporaryDirectory
+            .appendingPathComponent("MemoPilot-PaperChat-\(UUID().uuidString)", isDirectory: true)
+        try FileManager.default.createDirectory(at: tempDir, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: tempDir) }
 
-            let codexPath = CodexCLIBridge.findCodexBinary()
-            let codexLoggedIn = CodexCLIBridge.isCodexAuthenticated(codexBinary: codexPath)
+        let codexPath = CodexCLIBridge.findCodexBinary()
+        let codexLoggedIn = CodexCLIBridge.isCodexAuthenticated(codexBinary: codexPath)
 
-            let effectiveModelSlug: String = (speedProfile == .flash)
-                ? AISpeedProfile.balanced.cursorModelSlug
-                : speedProfile.cursorModelSlug
+        let effectiveModelSlug: String = (speedProfile == .flash)
+            ? AISpeedProfile.balanced.cursorModelSlug
+            : speedProfile.cursorModelSlug
 
-            var cursorAttemptError: Error?
-            if preferredMode != .openai,
-               let cursorBin = CodexCLIBridge.findCursorAgentBinary(),
+        var cursorAttemptError: Error?
+        if preferredMode != .openai {
+            if let cursorBin = CodexCLIBridge.findCursorAgentBinary(),
                let cursorKey = CodexCLIBridge.discoverCursorApiKey() {
                 do {
-                    let output = try CodexCLIBridge.runProcess(
+                    let output = try await CodexCLIBridge.runProcessCancellable(
                         cursorBin,
                         arguments: [
                             "--api-key", cursorKey,
@@ -287,88 +301,107 @@ public enum PaperDigestAnalyzer {
                             prompt
                         ],
                         workingDirectoryURL: tempDir,
-                        timeout: 65.0
+                        timeout: 75.0
                     )
                     let trimmed = output.trimmingCharacters(in: .whitespacesAndNewlines)
                     if !trimmed.isEmpty {
                         return trimmed
                     }
+                    let emptyErr = NSError(
+                        domain: "MemoPilot.PaperChat",
+                        code: 502,
+                        userInfo: [NSLocalizedDescriptionKey: "模型未返回有效回答，请稍后重试。"]
+                    )
+                    cursorAttemptError = emptyErr
+                    if preferredMode == .cursor {
+                        throw emptyErr
+                    }
+                } catch is CancellationError {
+                    throw CancellationError()
                 } catch {
+                    UserDefaults.standard.removeObject(forKey: "MemoPilot.cachedCursorApiKey")
                     cursorAttemptError = error
                     if preferredMode == .cursor {
                         throw error
                     }
                 }
-            }
-
-            guard let codexPath else {
-                if let cursorAttemptError { throw cursorAttemptError }
-                throw NSError(
-                    domain: "MemoPilot.PaperChat",
-                    code: 404,
-                    userInfo: [NSLocalizedDescriptionKey: "未检测到可用的 Cursor 连接或 OpenAI Codex CLI。"]
-                )
-            }
-
-            guard codexLoggedIn else {
-                if let cursorAttemptError { throw cursorAttemptError }
+            } else if preferredMode == .cursor {
                 throw NSError(
                     domain: "MemoPilot.PaperChat",
                     code: 401,
-                    userInfo: [NSLocalizedDescriptionKey: "尚未登录 OpenAI Codex 账号，请在右上角连接状态菜单中完成登录。"]
+                    userInfo: [NSLocalizedDescriptionKey: "当前已固定选择 Cursor 模式，但未检测到已登录的 Cursor Agent。请在右上角切换为自动模式或登录 Cursor。"]
                 )
             }
+        }
 
-            let outputURL = tempDir.appendingPathComponent("chat_reply.txt")
-            let args: [String] = [
-                "exec",
-                "--ephemeral",
-                "-C", tempDir.path,
-                "-c", "mcp_servers={}",
-                "-c", "model_reasoning_effort=\"\(speedProfile.codexReasoningEffort)\"",
-                "--disable", "shell_tool",
-                "--disable", "shell_snapshot",
-                "--disable", "plugins",
-                "--disable", "apps",
-                "--disable", "browser_use",
-                "--disable", "computer_use",
-                "--skip-git-repo-check",
-                "--sandbox", "read-only",
-                "-o", outputURL.path,
-                "--",
-                prompt
-            ]
-
-            let processOut = try CodexCLIBridge.runProcess(
-                codexPath,
-                arguments: args,
-                workingDirectoryURL: tempDir,
-                timeout: 75.0
+        guard let codexPath else {
+            if let cursorAttemptError { throw cursorAttemptError }
+            throw NSError(
+                domain: "MemoPilot.PaperChat",
+                code: 404,
+                userInfo: [NSLocalizedDescriptionKey: "未检测到可用的 Cursor 连接或 OpenAI Codex CLI。"]
             )
-            let replyText: String
-            if FileManager.default.fileExists(atPath: outputURL.path),
-               let fileStr = try? String(contentsOf: outputURL, encoding: .utf8),
-               !fileStr.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
-                replyText = fileStr
-            } else {
-                replyText = processOut
-            }
-            let cleanedReply = replyText.trimmingCharacters(in: .whitespacesAndNewlines)
-            guard !cleanedReply.isEmpty else {
-                throw NSError(
-                    domain: "MemoPilot.PaperChat",
-                    code: 500,
-                    userInfo: [NSLocalizedDescriptionKey: "AI 未返回回答内容，请稍后重试。"]
-                )
-            }
-            return cleanedReply
-        }.value
+        }
+
+        guard codexLoggedIn else {
+            if let cursorAttemptError { throw cursorAttemptError }
+            throw NSError(
+                domain: "MemoPilot.PaperChat",
+                code: 401,
+                userInfo: [NSLocalizedDescriptionKey: "尚未登录 OpenAI Codex 账号，请在右上角连接状态菜单中完成登录。"]
+            )
+        }
+
+        let outputURL = tempDir.appendingPathComponent("chat_reply.txt")
+        let args: [String] = [
+            "exec",
+            "--ephemeral",
+            "-C", tempDir.path,
+            "-c", "mcp_servers={}",
+            "-c", "model_reasoning_effort=\"\(speedProfile.codexReasoningEffort)\"",
+            "--disable", "shell_tool",
+            "--disable", "shell_snapshot",
+            "--disable", "plugins",
+            "--disable", "apps",
+            "--disable", "browser_use",
+            "--disable", "computer_use",
+            "--skip-git-repo-check",
+            "--sandbox", "read-only",
+            "-o", outputURL.path,
+            "--",
+            prompt
+        ]
+
+        let processOut = try await CodexCLIBridge.runProcessCancellable(
+            codexPath,
+            arguments: args,
+            workingDirectoryURL: tempDir,
+            timeout: 80.0
+        )
+        let replyText: String
+        if FileManager.default.fileExists(atPath: outputURL.path),
+           let fileStr = try? String(contentsOf: outputURL, encoding: .utf8),
+           !fileStr.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+            replyText = fileStr
+        } else {
+            replyText = processOut
+        }
+        let cleanedReply = replyText.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !cleanedReply.isEmpty else {
+            throw NSError(
+                domain: "MemoPilot.PaperChat",
+                code: 500,
+                userInfo: [NSLocalizedDescriptionKey: "AI 未返回回答内容，请稍后重试。"]
+            )
+        }
+        return cleanedReply
     }
 
     public static func buildFollowUpDiscussionPrompt(
         record: PaperDigestRecord,
         priorHistory: [PaperDiscussionMessage],
-        question: String
+        question: String,
+        pdfDocument: ExtractedPDFDocument? = nil
     ) -> String {
         let d = record.digest
         var contextLines: [String] = []
@@ -398,6 +431,33 @@ public enum PaperDigestAnalyzer {
             contextLines.append("\n【用户的个人批注】：\n\(record.userNotes)")
         }
 
+        let pdfExcerptsSection: String
+        let groundingRule: String
+        if let pdfDocument, !pdfDocument.pages.isEmpty {
+            let selected = PaperPDFService.selectRelevantPDFContext(
+                from: pdfDocument,
+                question: question,
+                priorHistory: priorHistory,
+                maxBudgetChars: 64_000
+            )
+            pdfExcerptsSection = """
+
+            ================ 原始论文 PDF 原文节选（共 \(pdfDocument.pageCount) 页） ================
+            \(selected)
+            """
+            groundingRule = """
+            1. 请同时结合下方的【论文结构化卡片】与【原始论文 PDF 原文节选】（及【历史对话】）深入作答，绝不要调用任何外部工具或联网命令。
+            2. 当回答涉及原论文的具体公式细节、超参数设置、网络结构、实验表格数据或附录说明时，请优先从【原始论文 PDF 原文节选】中提取精确数值与定义，并在句末自然标注出处（如「（见 PDF 第 5 页 / Table 2）」）。
+            3. 若某个实现细节既不在结构化卡片也不在整份原始 PDF 中（例如作者未开源披露的工程参数），请明确说明「原论文未披露该具体参数」，并给出有理有据的技术推演（绝不捏造实验数字）。
+            """
+        } else {
+            pdfExcerptsSection = "\n================ 原始论文 PDF 原文 ================\n（当前记录暂未挂载原始 PDF 全文，仅基于结构化卡片作答）"
+            groundingRule = """
+            1. 直接基于下方的【论文结构化卡片】（及【历史对话】）作答，绝不要调用任何外部工具或联网命令。
+            2. 若用户追问的超细枝末节未包含在当前结构化卡片中，请诚实说明「当前结构化卡片未包含该具体细节（可在讨论栏挂载原论文 PDF 以检索全文）」，并基于现有机制给出严谨的技术推演（绝不编造实验数字）。
+            """
+        }
+
         let recentTurns = priorHistory.suffix(10)
         let historyText: String
         if recentTurns.isEmpty {
@@ -410,16 +470,16 @@ public enum PaperDigestAnalyzer {
         }
 
         return """
-        你是用户的学术科研搭档（Cursor 研究助手）。用户正在阅读下方这篇已提取好结构化信息的论文卡片，并希望围绕这篇工作与你继续深入讨论。
+        你是用户的资深学术科研搭档与论文审稿助手。用户正在研读下方这篇工作，并希望围绕论文的方法机制、数学推导、实验设置与局限性继续深入讨论。
 
         请严格遵守以下回答原则：
-        1. 直接基于下方的【论文结构化信息】（及【历史对话】）作答，绝不要调用任何外部工具或联网命令。
-        2. 结论先行、逻辑锋利、言之有物，避免空泛客套话。引用方法步骤、消融结论或实验指标时尽量带上卡片中的具体数据或符号。
-        3. 如果用户追问的某个超细枝末节并未包含在上方结构化摘要中，请诚实指出「当前结构化摘要未披露该具体实现细节」，并基于现有机制给出有根据的技术推演（明确标注为推演，绝不编造实验数字）。
-        4. 排版清爽易读：可使用简短分段、`• ` 要点列表和 `**加粗**` 突出重点，数学符号请直接使用易读纯文本/Unicode（如 x_0、v、σ、1×p×p、→、≈），不要使用 `\\(...\\)` 或 `\\[...\\]` 反斜杠包裹，也不要输出二级大标题。
+        \(groundingRule)
+        4. 结论先行、逻辑锋利、言之有物，避免空泛客套话。
+        5. 排版清爽易读：可使用简短分段、`• ` 要点列表和 `**加粗**` 突出核心结论；数学符号请直接使用易读纯文本/Unicode（如 x_0、v、σ、1×p×p、→、≈），不要使用 `\\(...\\)` 或 `\\[...\\]` 反斜杠包裹，也不要输出 `#` 一二级大标题。
 
-        ================ 论文结构化信息 ================
+        ================ 论文结构化卡片 ================
         \(contextLines.joined(separator: "\n"))
+        \(pdfExcerptsSection)
 
         ================ 历史讨论上下文 ================
         \(historyText)
